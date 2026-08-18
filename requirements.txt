@@ -1,0 +1,46 @@
+# Kimiko Webook Booking Assistant - Python dependencies
+# Installed automatically by the Windows installer into a portable Python runtime.
+# To install manually:
+#   pip install -r requirements.txt
+#   playwright install chromium
+
+# Core browser automation
+playwright>=1.45.0
+
+# Async HTTP client used by several bots
+aiohttp>=3.9.0
+aiohttp-socks>=0.8.4
+
+# Visual-click / GUI automation fallback
+pyautogui>=0.9.54
+opencv-python>=4.9.0
+Pillow>=10.0.0
+
+# General HTTP / API calls
+requests>=2.31.0
+requests[socks]>=2.31.0
+urllib3>=2.0.0
+
+# Crypto / JWT helpers
+pycryptodome>=3.20.0
+PyJWT>=2.8.0
+cryptography>=42.0.0
+
+# WebSocket client
+websocket-client>=1.7.0
+
+# HTML / data parsing
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+simplejson>=3.19.0
+munch>=4.0.0
+
+# Config parsing
+tomlkit>=0.12.0
+
+# SeatCloud / events helper (optional; some scripts reference it)
+seatsio>=0.1.0
+
+# Utilities
+colorama>=0.4.6
+tqdm>=4.66.0

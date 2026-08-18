@@ -1,0 +1,22 @@
+{
+  "name": "webook-kimiko-booking",
+  "version": "1.0.0",
+  "description": "Webook event sections fetcher and automated booking assistant",
+  "main": "server.js",
+  "scripts": {
+    "start": "set NODE_OPTIONS=--max-old-space-size=4096 && node server.js",
+    "dev": "set NODE_OPTIONS=--max-old-space-size=4096 && node server.js",
+    "kill": "powershell -Command \"try { Import-Module NetTCPIP -ErrorAction SilentlyContinue } catch {}; try { Get-NetTCPConnection -LocalPort 3456 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } } catch {}; Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*server.js*' } | Stop-Process -Force -ErrorAction SilentlyContinue\" || taskkill //F //IM node.exe //FI \"WINDOWTITLE eq *server.js*\" 2>nul || taskkill //F //IM node.exe 2>nul || true"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "https-proxy-agent": "^9.1.0",
+    "playwright": "^1.45.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "socket.io": "^4.7.5",
+    "socks-proxy-agent": "^10.1.0",
+    "ws": "^8.18.0"
+  }
+}
