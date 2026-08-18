@@ -1,0 +1,822 @@
+const socket = io();
+
+const els = {
+  eventUrl: document.getElementById('eventUrl'),
+  fetchBtn: document.getElementById('fetchBtn'),
+  refreshAvailabilityBtn: document.getElementById('refreshAvailabilityBtn'),
+  eventInfo: document.getElementById('eventInfo'),
+  manualEmail: document.getElementById('manualEmail'),
+  manualPassword: document.getElementById('manualPassword'),
+  addAccountBtn: document.getElementById('addAccountBtn'),
+  addDefaultAccountBtn: document.getElementById('addDefaultAccountBtn'),
+  accountsFile: document.getElementById('accountsFile'),
+  accountsList: document.getElementById('accountsList'),
+  accountsSummary: document.getElementById('accountsSummary'),
+  selectAllAccountsBtn: document.getElementById('selectAllAccountsBtn'),
+  clearAccountsBtn: document.getElementById('clearAccountsBtn'),
+  removeAllAccountsBtn: document.getElementById('removeAllAccountsBtn'),
+  loadAccountsBtn: document.getElementById('loadAccountsBtn'),
+  saveAccountsBtn: document.getElementById('saveAccountsBtn'),
+  maxConcurrency: document.getElementById('maxConcurrency'),
+  concurrencyHint: document.getElementById('concurrencyHint'),
+  ticketMode: document.getElementById('ticketMode'),
+  ticketCount: document.getElementById('ticketCount'),
+  ticketCountHint: document.getElementById('ticketCountHint'),
+  startBookingBtn: document.getElementById('startBookingBtn'),
+  stopBookingBtn: document.getElementById('stopBookingBtn'),
+  downloadLogsBtn: document.getElementById('downloadLogsBtn'),
+  clearLogsBtn: document.getElementById('clearLogsBtn'),
+  startPairCyclingBtn: document.getElementById('startPairCyclingBtn'),
+  stopPairCyclingBtn: document.getElementById('stopPairCyclingBtn'),
+  pairCyclesStatus: document.getElementById('pairCyclesStatus'),
+  sectionsList: document.getElementById('sectionsList'),
+  selectionHint: document.getElementById('selectionHint'),
+  statusBadge: document.getElementById('statusBadge'),
+  activeCount: document.getElementById('activeCount'),
+  pendingCount: document.getElementById('pendingCount'),
+  doneCount: document.getElementById('doneCount'),
+  heldCount: document.getElementById('heldCount'),
+  logs: document.getElementById('logs'),
+};
+
+let sectionsData = [];
+let eventTitle = '';
+let eventMaxPerOrder = 30;
+let accounts = [];
+let running = false;
+
+function log(message, type = 'info') {
+  const time = new Date().toLocaleTimeString();
+  const entry = document.createElement('div');
+  entry.className = `log-entry ${type}`;
+  entry.innerHTML = `<span class="time">[${time}]</span> ${escapeHtml(message)}`;
+  els.logs.appendChild(entry);
+  els.logs.scrollTop = els.logs.scrollHeight;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function parseSeatName(name) {
+  const parts = name.split('-');
+  if (parts.length < 3) return null;
+  const seat = parts.pop();
+  const row = parts.pop();
+  const section = parts.join('-');
+  return { section, row, seat };
+}
+
+function formatSeat(seatName) {
+  const p = parseSeatName(seatName);
+  if (!p) return escapeHtml(seatName);
+  const section = sectionsData.find(s => s.label === p.section);
+  const categoryTitle = section?.categories?.[0]?.title || p.section;
+  const sec = escapeHtml(p.section);
+  const row = escapeHtml(p.row);
+  const seat = escapeHtml(p.seat);
+  const cat = escapeHtml(categoryTitle);
+  return `<span class="seat-chip">${cat} (القسم: ${sec} - الصف: ${row} - المقعد: ${seat})</span>`;
+}
+
+function formatSeatList(seats) {
+  if (!seats || seats.length === 0) return '';
+  return `<span class="seat-list">${seats.map(formatSeat).join('')}</span>`;
+}
+
+function renderSeatChips(username, seats) {
+  if (!seats || seats.length === 0) return '';
+  return `<div class="seat-chips">${seats.map(seatName => {
+    const p = parseSeatName(seatName);
+    const label = p ? `${p.section} ${p.row}-${p.seat}` : seatName;
+    return `<span class="seat-chip-with-action">
+      <span class="seat-chip">${escapeHtml(label)}</span>
+      <button class="btn-release-seat" data-action="release-seat" data-seat="${escapeHtml(seatName)}" title="فك مسك هذا المقعد">×</button>
+    </span>`;
+  }).join('')}</div>`;
+}
+
+function setStatus(stage, message) {
+  const badge = els.statusBadge;
+  badge.className = 'badge';
+  badge.textContent = stageLabel(stage).toUpperCase();
+  if (stage === 'idle') badge.classList.add('idle');
+  else if (['paused', 'holding', 'captcha', 'login-manual', 'seats-partial', 'queued'].includes(stage)) badge.classList.add('paused');
+  else if (stage === 'error' || stage === 'failed') badge.classList.add('error');
+  else if (['payment-ready', 'done', 'success'].includes(stage)) badge.classList.add('success');
+  else badge.classList.add('running');
+  log(`${stageLabel(stage)}: ${message}`);
+}
+
+socket.on('status', data => {
+  setStatus(data.stage, `${data.account ? `[${data.account}] ` : ''}${data.message}`);
+  if (data.account) updateAccountRow(data.account, data.stage, data);
+  if (['idle', 'error', 'payment-ready'].includes(data.stage) && !data.account) {
+    setLoading(false);
+  }
+});
+
+socket.on('account-update', data => {
+  updateAccountRow(data.account, data.stage, data);
+});
+
+socket.on('queue-stats', stats => {
+  els.activeCount.textContent = stats.active || 0;
+  els.pendingCount.textContent = stats.pending || 0;
+  els.doneCount.textContent = stats.done || 0;
+  if (running && stats.active === 0 && stats.pending === 0) {
+    setLoading(false);
+  }
+  updateHeldCount();
+});
+
+socket.on('console', data => log(`Console ${data.type}: ${data.text}`, 'error'));
+socket.on('network', data => log(`Network ${data.status}: ${data.url}`));
+
+// Pair cycling status updates
+socket.on('pair-cycle-status', data => {
+  renderPairCyclesStatus(data.cycles || []);
+});
+
+socket.on('pair-cycle-event', data => {
+  log(`[Pair ${data.pairId}] ${data.message}`, data.stage === 'error' || data.stage === 'failed' ? 'error' : 'info');
+  refreshPairCyclesStatus();
+});
+
+function setLoading(loading) {
+  running = loading;
+  els.fetchBtn.disabled = loading;
+  els.refreshAvailabilityBtn.disabled = loading;
+  els.startBookingBtn.disabled = loading || getSelectedSections().length === 0 || !accounts.some(a => a.selected);
+  els.accountsFile.disabled = loading;
+  updateButtonStates();
+}
+
+function getSelectedSections() {
+  return sectionsData.filter(s => s.selected).map(s => s.label);
+}
+
+function updateButtonStates() {
+  const hasSelectedAccounts = accounts.some(a => a.selected);
+  const hasSelectedSections = getSelectedSections().length > 0;
+  els.startBookingBtn.disabled = running || !hasSelectedAccounts || !hasSelectedSections;
+
+  const selected = getSelectedSections();
+  if (els.selectionHint) {
+    if (selected.length === 0) {
+      els.selectionHint.textContent = 'اختر قسماً واحداً على الأقل ليتم تفعيل زر بدء الحجز';
+    } else {
+      els.selectionHint.textContent = `الأقسام المختارة: ${selected.join('، ')} (${selected.length})`;
+    }
+  }
+}
+
+// Sections / availability
+async function loadSections() {
+  const url = els.eventUrl.value.trim();
+  if (!url) return alert('أدخل رابط الفعالية');
+  setLoading(true);
+  log('جاري جلب الأقسام والتوفر...');
+  try {
+    const res = await fetch(`/api/chart-sections?url=${encodeURIComponent(url)}`);
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || 'Unknown error');
+    eventTitle = json.event || '';
+    eventMaxPerOrder = 30; // user requested: override platform limits to 30
+    showEventInfo(json.event, json.chartSections);
+    const previousSelected = new Set(getSelectedSections());
+    sectionsData = (json.chartSections || []).map(s => ({
+      ...s,
+      selected: previousSelected.has(s.label),
+    }));
+    renderSections();
+    updateTicketHints();
+    log(`تم تحميل ${sectionsData.length} أقسام لـ "${eventTitle}". الحد الأقصى للطلب الواحد: ${eventMaxPerOrder} تذاكر.`);
+  } catch (err) {
+    log(`فشل جلب الأقسام: ${err.message}`, 'error');
+    alert('فشل جلب الأقسام: ' + err.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+function updateTicketHints() {
+  const mode = els.ticketMode ? els.ticketMode.value : 'per-account';
+  const count = parseInt(els.ticketCount.value, 10) || 30;
+  const selectedAccounts = accounts.filter(a => a.selected).length || 1;
+
+  if (mode === 'total') {
+    els.ticketCountHint.textContent = `الهدف: ${count} تذكرة إجمالياً.`;
+  } else if (mode === 'auto-split') {
+    els.ticketCountHint.textContent = `سيتم تقسيم المقاعد المتاحة بالتساوي بين ${selectedAccounts} حسابات (هدف ${count}/حساب).`;
+  } else {
+    els.ticketCountHint.textContent = `سيتم مسك ${count} تذكرة/حساب.`;
+  }
+}
+
+function showEventInfo(event, sections) {
+  if (!event) {
+    els.eventInfo.classList.add('hidden');
+    return;
+  }
+  const totalAvailable = sections.reduce((sum, s) => sum + (s.availableCount || 0), 0);
+  const availableSections = sections.filter(s => (s.availableCount || 0) > 0).length;
+  els.eventInfo.innerHTML = `
+    <strong>${escapeHtml(event)}</strong>
+    <span>إجمالي المقاعد المتاحة: <b>${totalAvailable}</b></span>
+    <span>الأقسام المتاحة: <b>${availableSections}</b> / ${sections.length}</span>
+  `;
+  els.eventInfo.classList.remove('hidden');
+}
+
+els.fetchBtn.addEventListener('click', loadSections);
+els.refreshAvailabilityBtn.addEventListener('click', loadSections);
+
+function formatPrice(categories) {
+  if (!categories || categories.length === 0) return '';
+  const totals = categories.map(c => c.total).filter(Boolean);
+  if (totals.length === 0) return '';
+  const min = Math.min(...totals);
+  const max = Math.max(...totals);
+  if (min === max) return `${min.toFixed(2)} ر.س`;
+  return `${min.toFixed(2)} - ${max.toFixed(2)} ر.س`;
+}
+
+function toggleSection(label) {
+  const section = sectionsData.find(s => s.label === label);
+  if (!section) return;
+  section.selected = !section.selected;
+  renderSections();
+}
+
+function renderSections() {
+  els.sectionsList.innerHTML = '';
+
+  if (sectionsData.length === 0) {
+    els.sectionsList.innerHTML = '<p style="color:var(--muted)">لا توجد أقسام متاحة. اضغط "جلب الأقسام".</p>';
+    updateButtonStates();
+    return;
+  }
+
+  sectionsData.forEach(section => {
+    const price = formatPrice(section.categories);
+    const categoriesText = (section.categories || []).map(c => c.title).join(' / ') || '';
+    const isSoldOut = (section.availableCount || 0) === 0;
+    const badge = isSoldOut
+      ? '<span class="section-badge sold-out-badge">ممتلئ · متابعة</span>'
+      : '';
+
+    const item = document.createElement('div');
+    item.className = 'section-item' + (section.selected ? ' selected' : '') + (isSoldOut ? ' sold-out' : '');
+    item.innerHTML = `
+      <input type="checkbox" class="section-checkbox" ${section.selected ? 'checked' : ''}>
+      <div class="section-info">
+        <div class="section-title">${escapeHtml(section.label)} ${categoriesText ? `<small>(${escapeHtml(categoriesText)})</small>` : ''} ${badge}</div>
+        <div class="section-meta">مقاعد متاحة: <b>${section.availableCount || 0}</b></div>
+      </div>
+      <div class="section-price">${escapeHtml(price)}</div>
+    `;
+
+    const checkbox = item.querySelector('.section-checkbox');
+    checkbox.addEventListener('change', e => {
+      e.stopPropagation();
+      toggleSection(section.label);
+    });
+    item.addEventListener('click', e => {
+      if (e.target === checkbox) return;
+      toggleSection(section.label);
+    });
+    els.sectionsList.appendChild(item);
+  });
+
+  updateButtonStates();
+}
+
+// Accounts
+function upsertAccount(username, password, selected = true) {
+  username = username.trim();
+  password = password.trim();
+  if (!username || !password) return;
+  const existing = accounts.find(a => a.username === username);
+  if (existing) {
+    existing.password = password;
+    existing.selected = selected;
+  } else {
+    accounts.push({
+      id: `${Date.now()}-${username}`,
+      username,
+      password,
+      selected,
+      stage: 'idle',
+      seats: [],
+      queuePosition: null,
+    });
+  }
+  renderAccounts();
+}
+
+// Kept for backwards compatibility; new code should use upsertAccount.
+function addAccount(username, password, selected = true) {
+  upsertAccount(username, password, selected);
+}
+
+async function loadAccountsFromServer() {
+  try {
+    const res = await fetch('/api/load-accounts');
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    const loaded = json.accounts || [];
+    for (const a of loaded) {
+      upsertAccount(a.username, a.password, true);
+    }
+    log(`تم تحميل ${loaded.length} حساب من الخادم`);
+  } catch (err) {
+    log(`فشل تحميل الحسابات من الخادم: ${err.message}`, 'error');
+  }
+}
+
+async function saveAccountsToServer() {
+  try {
+    const payload = accounts.map(a => ({ username: a.username, password: a.password }));
+    const res = await fetch('/api/save-accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accounts: payload }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    log(`تم حفظ ${json.count} حساب على الخادم`);
+  } catch (err) {
+    log(`فشل حفظ الحسابات على الخادم: ${err.message}`, 'error');
+  }
+}
+
+els.addAccountBtn.addEventListener('click', () => {
+  upsertAccount(els.manualEmail.value, els.manualPassword.value);
+  els.manualEmail.value = '';
+  els.manualPassword.value = '';
+});
+
+els.addDefaultAccountBtn.addEventListener('click', () => {
+  upsertAccount('tariqibrahim20@hotmail.com', 'Dd112233@');
+});
+
+els.accountsFile.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const text = reader.result;
+    let added = 0;
+    text.split(/\r?\n/).forEach(line => {
+      line = line.trim();
+      if (!line || line.startsWith('#')) return;
+      const sep = line.indexOf(':');
+      if (sep === -1) return;
+      const username = line.slice(0, sep).trim();
+      const password = line.slice(sep + 1).trim();
+      if (username && password) {
+        upsertAccount(username, password);
+        added++;
+      }
+    });
+    log(`تم تحميل ${added} حسابات من ${file.name}`);
+  };
+  reader.readAsText(file);
+});
+
+function renderAccounts() {
+  els.accountsList.innerHTML = '';
+  if (accounts.length === 0) {
+    els.accountsList.innerHTML = '<p style="color:var(--muted)">لم يتم تحميل حسابات</p>';
+    els.accountsSummary.textContent = '0 حساب محمل';
+    updateButtonStates();
+    return;
+  }
+
+  accounts.forEach(acc => {
+    const hasSeats = acc.seats && acc.seats.length > 0;
+    // Any non-idle stage means the bot is doing something with this account.
+    const isActive = acc.stage !== 'idle' && acc.stage !== 'error';
+    // Holding = has seats OR is in a stage where it actually holds / can pay for seats.
+    const isHolding = hasSeats || ['paused', 'payment-ready', 'holding', 'done', 'payment', 'seats-selected', 'seats-partial', 'seats-synced', 'cycle-holding', 'seats-grabbed', 'seats-monitoring', 'seats-sniping'].includes(acc.stage);
+    // Stop should be enabled whenever the bot is actively working.
+    const isRunning = isActive || ['queued', 'selecting', 'launching', 'navigating', 'logging-in', 'cycle-holding', 'seats-grabbed', 'seats-monitoring', 'seats-sniping'].includes(acc.stage);
+    const row = document.createElement('div');
+    row.className = 'account-row' + (acc.selected ? ' selected' : '') + ` stage-${acc.stage}`;
+    row.dataset.id = acc.id;
+    const stage = stageLabel(acc.stage, acc.queuePosition);
+    const seatsHtml = hasSeats ? renderSeatChips(acc.username, acc.seats) : '';
+    const queueBadge = acc.queuePosition != null
+      ? `<span class="queue-badge">طابور #${acc.queuePosition.toLocaleString('en-US')}${acc.queueTotal ? ` / ${acc.queueTotal.toLocaleString('en-US')}` : ''}</span>`
+      : '';
+    row.innerHTML = `
+      <input type="checkbox" ${acc.selected ? 'checked' : ''}>
+      <div class="account-info">
+        <div class="account-user">${escapeHtml(acc.username)}</div>
+        <div class="account-stage">${stage}</div>
+        ${queueBadge}
+        <div class="account-seats">${seatsHtml}</div>
+      </div>
+      <div class="account-actions">
+        <button class="btn-proceed" data-action="proceed" ${!isHolding ? 'disabled' : ''}>دفع</button>
+        <button class="btn-release" data-action="release" ${!isHolding ? 'disabled' : ''}>فك الكل</button>
+        <button class="btn-stop" data-action="stop" ${!isRunning ? 'disabled' : ''}>إيقاف</button>
+        <button class="btn-delete" data-action="delete">🗑️</button>
+      </div>
+    `;
+    row.querySelector('input').addEventListener('change', () => {
+      acc.selected = !acc.selected;
+      renderAccounts();
+    });
+    row.querySelector('[data-action="proceed"]').addEventListener('click', () => proceedAccount(acc.username));
+    row.querySelector('[data-action="release"]').addEventListener('click', () => releaseAccount(acc.username));
+    row.querySelector('[data-action="stop"]').addEventListener('click', () => stopAccount(acc.username));
+    row.querySelector('[data-action="delete"]').addEventListener('click', () => deleteAccount(acc.username));
+    // Bind per-seat release buttons.
+    row.querySelectorAll('[data-action="release-seat"]').forEach(btn => {
+      btn.addEventListener('click', () => releaseSeat(acc.username, btn.dataset.seat));
+    });
+    els.accountsList.appendChild(row);
+  });
+
+  const selectedCount = accounts.filter(a => a.selected).length;
+  els.accountsSummary.textContent = `${accounts.length} حساب محمل · ${selectedCount} محدد`;
+  updateButtonStates();
+  updateHeldCount();
+  updateTicketHints();
+}
+
+function stageLabel(stage, position = null) {
+  const map = {
+    idle: 'في الانتظار',
+    queued: `في الطابور${position ? ` #${position}` : ''}`,
+    launching: 'يتم التشغيل',
+    navigating: 'تحميل الصفحة',
+    login: 'تسجيل الدخول',
+    chart: 'تحميل المقاعد',
+    selecting: 'اختيار المقاعد',
+    holding: 'حجز المقاعد',
+    paused: 'جاهز للدفع',
+    payment: 'صفحة الدفع',
+    'payment-ready': 'جاهز للدفع',
+    'seats-selected': 'تم المسك',
+    'seats-partial': 'مسك جزئي',
+    'seats-synced': 'تمت مزامنة الشارت',
+    'cycle-holding': 'مسك في دورة تناوب',
+    'seats-sniping': 'سنايبر',
+    'seats-monitoring': 'مراقبة التوفر',
+    'seats-grabbed': 'تم مسك مقعد',
+    done: 'اكتمل الدفع',
+    error: 'خطأ',
+    failed: 'خطأ',
+  };
+  return map[stage] || stage;
+}
+
+function updateAccountRow(username, stage, data) {
+  const acc = accounts.find(a => a.username === username);
+  if (!acc) return;
+  acc.stage = stage;
+  if (data.seats && Array.isArray(data.seats)) acc.seats = data.seats;
+  if (data.verifiedSeats && Array.isArray(data.verifiedSeats)) acc.seats = data.verifiedSeats;
+
+  // Update queue position for any queue-related status so it stays live.
+  const isQueueStage = stage === 'queued' || stage === 'queue-waiting' || stage === 'queue-detected' || stage === 'queue-detected-post-login' || stage === 'queue-position';
+  if (isQueueStage && typeof data.position === 'number') {
+    acc.queuePosition = data.position;
+    acc.queueTotal = data.total || acc.queueTotal;
+  } else if (!isQueueStage) {
+    acc.queuePosition = null;
+    acc.queueTotal = null;
+  }
+
+  // Prefer lightweight DOM update over full re-render when only queue position changed.
+  if (stage === 'queue-position' || stage === 'queue-waiting') {
+    updateAccountRowDom(acc);
+  } else {
+    renderAccounts();
+  }
+}
+
+function updateAccountRowDom(acc) {
+  const row = els.accountsList.querySelector(`.account-row[data-id="${acc.id}"]`);
+  if (!row) {
+    renderAccounts();
+    return;
+  }
+  const stageEl = row.querySelector('.account-stage');
+  if (stageEl) {
+    stageEl.textContent = stageLabel(acc.stage, acc.queuePosition);
+  }
+  // Add/refresh queue badge
+  let badge = row.querySelector('.queue-badge');
+  if (acc.queuePosition != null) {
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'queue-badge';
+      const info = row.querySelector('.account-info');
+      if (info) info.appendChild(badge);
+    }
+    badge.textContent = `طابور #${acc.queuePosition.toLocaleString('en-US')}${acc.queueTotal ? ` / ${acc.queueTotal.toLocaleString('en-US')}` : ''}`;
+  } else if (badge) {
+    badge.remove();
+  }
+}
+
+function updateHeldCount() {
+  const total = accounts.reduce((sum, a) => sum + (a.seats?.length || 0), 0);
+  els.heldCount.textContent = total;
+}
+
+els.selectAllAccountsBtn.addEventListener('click', () => {
+  accounts.forEach(a => a.selected = true);
+  renderAccounts();
+});
+
+els.clearAccountsBtn.addEventListener('click', () => {
+  accounts.forEach(a => a.selected = false);
+  renderAccounts();
+});
+
+els.removeAllAccountsBtn.addEventListener('click', () => {
+  accounts = [];
+  renderAccounts();
+});
+
+els.loadAccountsBtn.addEventListener('click', loadAccountsFromServer);
+els.saveAccountsBtn.addEventListener('click', saveAccountsToServer);
+
+function deleteAccount(username) {
+  accounts = accounts.filter(a => a.username !== username);
+  renderAccounts();
+  log(`تم حذف الحساب: ${username}`);
+}
+
+function updateConcurrencyHint(val) {
+  const v = parseInt(val, 10) || 0;
+  if (v === 0) {
+    els.concurrencyHint.textContent = 'سيتم حساب العدد المثالي تلقائياً حسب الرام والبروسيسور';
+  } else if (v === 1) {
+    els.concurrencyHint.textContent = 'سيفتح حساب واحد فقط في نفس الوقت (أنصح به لتجنب الأخطاء)';
+  } else {
+    els.concurrencyHint.textContent = `سيفتح ${v} متصفح كحد أقصى في نفس الوقت`;
+  }
+}
+
+async function loadEstimatedConcurrency() {
+  try {
+    const res = await fetch('/api/estimate-concurrency');
+    const json = await res.json();
+    if (json.success) {
+      // Default to a moderate concurrent count for speed; user can still override.
+      const estimated = Math.max(1, Math.min(json.concurrency || 1, 4));
+      els.maxConcurrency.value = estimated;
+      updateConcurrencyHint(estimated);
+    }
+  } catch (err) {
+    console.error('Failed to load concurrency estimate', err);
+  }
+}
+
+els.maxConcurrency.addEventListener('input', () => updateConcurrencyHint(els.maxConcurrency.value));
+if (els.ticketMode) els.ticketMode.addEventListener('change', updateTicketHints);
+els.ticketCount.addEventListener('input', updateTicketHints);
+
+// Start / Stop
+els.startBookingBtn.addEventListener('click', async () => {
+  const url = els.eventUrl.value.trim();
+  const targetSections = getSelectedSections();
+  const maxConcurrency = parseInt(els.maxConcurrency.value, 10) || 0;
+  const ticketCount = Math.max(1, parseInt(els.ticketCount.value, 10) || 30);
+  const mode = els.ticketMode ? els.ticketMode.value : 'per-account';
+  const selected = accounts.filter(a => a.selected);
+  if (!url) return alert('أدخل رابط الفعالية');
+  if (targetSections.length === 0) return alert('اختر قسماً واحداً على الأقل');
+  if (selected.length === 0) return alert('اختر حساب واحد على الأقل');
+
+  setLoading(true);
+  try {
+    const res = await fetch('/api/start-booking', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, targetSections, accounts: selected, maxConcurrency, ticketCount, mode }),
+    });
+    let json;
+    try {
+      json = await res.json();
+    } catch (parseErr) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Server returned invalid JSON. Status: ${res.status}. Body: ${text.substring(0, 200)}`);
+    }
+    if (!json.success) throw new Error(json.error || 'Unknown server error');
+    const modeLabel = { 'total': 'إجمالي', 'auto-split': 'توزيع ذكي', 'per-account': 'للحساب' }[mode] || mode;
+    log(`بدأ الحجز لـ ${selected.length} حساب. الأقسام: ${targetSections.join(', ')}. ${modeLabel}: ${ticketCount}. التوازي: ${json.maxConcurrency}.`);
+  } catch (err) {
+    log(`فشل بدء الحجز: ${err.message}`, 'error');
+    setLoading(false);
+  }
+});
+
+els.stopBookingBtn.addEventListener('click', async () => {
+  await fetch('/api/stop-booking', { method: 'POST' });
+  log('تم إرسال إشارة إيقاف الكل');
+});
+
+els.downloadLogsBtn.addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/logs');
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    const blob = new Blob([json.logs], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `kimiko-logs-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    log('تم تحميل السجل');
+  } catch (err) {
+    log(`فشل تحميل السجل: ${err.message}`, 'error');
+  }
+});
+
+els.clearLogsBtn.addEventListener('click', () => {
+  els.logs.innerHTML = '';
+});
+
+async function proceedAccount(username) {
+  try {
+    const res = await fetch('/api/proceed-payment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    log(`تم إرسال أمر الدفع لـ ${username}`);
+  } catch (err) {
+    log(`فشل الدفع لـ ${username}: ${err.message}`, 'error');
+  }
+}
+
+async function stopAccount(username) {
+  try {
+    const res = await fetch('/api/stop-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    log(`تم إرسال إيقاف لـ ${username}`);
+  } catch (err) {
+    log(`فشل الإيقاف لـ ${username}: ${err.message}`, 'error');
+  }
+}
+
+async function releaseAccount(username) {
+  try {
+    const res = await fetch('/api/release-hold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    const acc = accounts.find(a => a.username === username);
+    if (acc) {
+      acc.seats = [];
+      acc.stage = 'idle';
+    }
+    renderAccounts();
+    log(`تم فك المسك لـ ${username}`);
+  } catch (err) {
+    log(`فشل فك المسك لـ ${username}: ${err.message}`, 'error');
+  }
+}
+
+async function releaseSeat(username, seat) {
+  try {
+    const res = await fetch('/api/release-seat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, seat }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    const acc = accounts.find(a => a.username === username);
+    if (acc && json.seats) {
+      acc.seats = json.seats;
+    }
+    renderAccounts();
+    log(`تم فك مسك المقعد ${seat} لـ ${username}`);
+  } catch (err) {
+    log(`فشل فك مسك المقعد ${seat} لـ ${username}: ${err.message}`, 'error');
+  }
+}
+
+// Pair Cycling UI
+let pairCyclesRefreshTimer = null;
+
+function renderPairCyclesStatus(cycles) {
+  if (!els.pairCyclesStatus) return;
+  if (!cycles || cycles.length === 0) {
+    els.pairCyclesStatus.classList.add('hidden');
+    els.pairCyclesStatus.innerHTML = '';
+    return;
+  }
+
+  els.pairCyclesStatus.classList.remove('hidden');
+  const html = cycles.map(c => {
+    const elapsedMin = Math.floor(c.elapsedMs / 60000);
+    const elapsedSec = Math.floor((c.elapsedMs % 60000) / 1000);
+    return `
+      <div class="pair-cycle-card">
+        <div class="pair-cycle-header">
+          <strong>${escapeHtml(c.pairId)}</strong>
+          <span class="pair-cycle-status status-${escapeHtml(c.status).toLowerCase()}">${escapeHtml(c.status)}</span>
+        </div>
+        <div class="pair-cycle-body">
+          <div>موجة ${c.currentWave}/${c.maxWaves}</div>
+          <div>الحالي: ${escapeHtml(c.activeUser)}</div>
+          <div>مقاعد ممسوكة: ${c.seatCount}</div>
+          <div>مرت منذ البدء: ${elapsedMin}m ${elapsedSec}s</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+  els.pairCyclesStatus.innerHTML = html;
+}
+
+async function refreshPairCyclesStatus() {
+  try {
+    const res = await fetch('/api/pair-cycles');
+    const json = await res.json();
+    if (json.success) {
+      renderPairCyclesStatus(json.cycles);
+      if (json.cycles && json.cycles.length > 0 && !pairCyclesRefreshTimer) {
+        pairCyclesRefreshTimer = setInterval(refreshPairCyclesStatus, 5000);
+      } else if ((!json.cycles || json.cycles.length === 0) && pairCyclesRefreshTimer) {
+        clearInterval(pairCyclesRefreshTimer);
+        pairCyclesRefreshTimer = null;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to refresh pair cycles', err);
+  }
+}
+
+if (els.startPairCyclingBtn) {
+  els.startPairCyclingBtn.addEventListener('click', async () => {
+    const url = els.eventUrl.value.trim();
+    const targetSections = getSelectedSections();
+    const ticketCount = Math.max(1, parseInt(els.ticketCount.value, 10) || 30);
+    const selected = accounts.filter(a => a.selected);
+    if (!url) return alert('أدخل رابط الفعالية');
+    if (targetSections.length === 0) return alert('اختر قسماً واحداً على الأقل');
+    if (selected.length < 2) return alert('اختر حسابين على الأقل للتناوب');
+
+    setLoading(true);
+    try {
+      const res = await fetch('/api/start-pair-cycling', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, targetSections, accounts: selected, ticketCount }),
+      });
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || 'Unknown server error');
+      log(`بدأ Pair Cycling لـ ${selected.length} حساب. الأزواج: ${json.pairCount}. Standby: ${json.standby || 'لا يوجد'}.`);
+      refreshPairCyclesStatus();
+    } catch (err) {
+      log(`فشل بدء Pair Cycling: ${err.message}`, 'error');
+      setLoading(false);
+    }
+  });
+}
+
+if (els.stopPairCyclingBtn) {
+  els.stopPairCyclingBtn.addEventListener('click', async () => {
+    try {
+      const res = await fetch('/api/stop-pair-cycling', { method: 'POST' });
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error);
+      log('تم إيقاف Pair Cycling وتحرير المقاعد');
+      renderPairCyclesStatus([]);
+      if (pairCyclesRefreshTimer) {
+        clearInterval(pairCyclesRefreshTimer);
+        pairCyclesRefreshTimer = null;
+      }
+    } catch (err) {
+      log(`فشل إيقاف Pair Cycling: ${err.message}`, 'error');
+    }
+  });
+}
+
+// Init
+renderAccounts();
+loadEstimatedConcurrency();
+loadAccountsFromServer();
+log('جاهز. أدخل رابط الفعالية، اجلب الأقسام، اختر الأقسام والحسابات، ثم اضغط بدء الحجز.');

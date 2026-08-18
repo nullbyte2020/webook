@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kimiko Webook Booking Assistant</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <h1>🎫 Kimiko Webook Booking Assistant</h1>
+      <p class="subtitle">حجز آلي لمقاعد webook.com</p>
+    </header>
+
+    <!-- Top Navigation -->
+    <nav class="tab-nav" aria-label="Main navigation">
+      <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+      <button class="tab-btn" data-tab="accounts">Accounts</button>
+      <button class="tab-btn" data-tab="proxies">Proxies</button>
+      <button class="tab-btn" data-tab="settings">Settings</button>
+    </nav>
+
+    <!-- Dashboard Tab -->
+    <div class="tab-content active" id="tab-dashboard">
+      <!-- Status Dashboard -->
+      <section class="card dashboard">
+        <div class="dashboard-main">
+          <div class="status-pill">
+            <span id="statusBadge" class="badge idle">Idle</span>
+            <span id="sniperPulse" class="sniper-pulse hidden" title="Sniper active"></span>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-box">
+              <span class="stat-value" id="activeCount">0</span>
+              <span class="stat-label">نشط</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-value" id="pendingCount">0</span>
+              <span class="stat-label">في الانتظار</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-value" id="doneCount">0</span>
+              <span class="stat-label">اكتمل</span>
+            </div>
+            <div class="stat-box success">
+              <span class="stat-value" id="heldCount">0</span>
+              <span class="stat-label">مقاعد ممسوكة</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Main Control Buttons -->
+      <section class="card dashboard-toolbar">
+        <div class="control-buttons">
+          <button id="startBookingBtn" class="primary big">🚀 بدء الحجز</button>
+          <button id="stopBookingBtn" class="danger big">⛔ إيقاف الكل</button>
+        </div>
+      </section>
+
+      <!-- Logs Section -->
+      <section class="card logs-card">
+        <div class="logs-header">
+          <h2>📊 السجل</h2>
+          <input type="text" id="logSearch" class="log-search" placeholder="بحث أو تصفية..." />
+        </div>
+        <div id="logs" class="logs"></div>
+        <div class="row">
+          <button id="downloadLogsBtn" class="secondary">📥 تحميل السجل</button>
+          <button id="clearLogsBtn" class="secondary">🧹 مسح السجل</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- Accounts Tab -->
+    <div class="tab-content" id="tab-accounts">
+      <!-- Event URL Section -->
+      <section class="card">
+        <h2>🔗 رابط الفعالية</h2>
+        <input type="text" id="eventUrl" placeholder="https://webook.com/ar/sa/jed/music-events/events/.../book"
+          value="https://webook.com/ar/sa/jed/music-events/events/this-is-michael-musical-show-jeddah-tickets-2026/book" />
+        <div class="row">
+          <button id="fetchBtn" class="primary">🔍 جلب الأقسام</button>
+          <button id="refreshAvailabilityBtn" class="secondary">🔄 تحديث</button>
+          <button id="checkQueueBtn" class="secondary hidden">🚦 اختبار الطابور</button>
+        </div>
+        <div id="eventInfo" class="event-info hidden">
+          <div class="event-info-header">
+            <strong id="eventInfoTitle"></strong>
+            <span id="eventQueueBadge" class="event-badge unknown hidden">غير معروف</span>
+          </div>
+          <div id="eventInfoBody"></div>
+        </div>
+      </section>
+
+      <!-- Accounts Section -->
+      <section class="card">
+        <h2>👥 الحسابات</h2>
+
+        <div class="add-account-card">
+          <h3>➕ إضافة حساب</h3>
+          <div class="add-account-tabs">
+            <button type="button" class="add-account-tab active" data-method="credentials">🔑 بيانات الدخول</button>
+            <button type="button" class="add-account-tab" data-method="cookies">🍪 كوكيز</button>
+          </div>
+
+          <div class="add-account-panel active" id="credentialsPanel">
+            <div class="account-inputs">
+              <div class="form-row">
+                <div class="form-group">
+                  <label>البريد الإلكتروني</label>
+                  <input type="email" id="manualEmail" placeholder="example@email.com" value="tariqibrahim20@hotmail.com" />
+                </div>
+                <div class="form-group">
+                  <label>كلمة المرور</label>
+                  <input type="password" id="manualPassword" placeholder="••••••" value="Dd112233@" />
+                </div>
+              </div>
+              <div class="row">
+                <button id="addAccountBtn" class="success">➕ إضافة حساب</button>
+                <button id="addDefaultAccountBtn" class="secondary">استخدام الحساب الافتراضي</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="add-account-panel" id="cookiesPanel">
+            <div class="account-inputs holdtoken-inputs">
+              <p class="hint">💡 وضع الكوكيز بيحجز مباشرة من غير تسجيل دخول بالإيميل/الباسورد.</p>
+              <div class="cookie-instructions">
+                <strong>خطوات إضافة الحساب بالكوكيز:</strong>
+                <ol>
+                  <li>نزل إضافة Chrome: <a href="https://chromewebstore.google.com/detail/cookies-extractor/gdbmkehljhmfcjgbjcfaklnabeccddna?hl=en" target="_blank" rel="noopener">Cookies Extractor</a></li>
+                  <li>افتح event webook في Chrome وسجل دخول بالحساب.</li>
+                  <li>اضغط على أيقونة الإضافة واختر <strong>Copy as JSON</strong> أو <strong>Copy as Header</strong>.</li>
+                  <li>الصق الكوكيز هنا ثم اضغط "إضافة للحجز".</li>
+                </ol>
+              </div>
+              <div class="form-row">
+                <div class="form-group wide">
+                  <label>الصق الكوكيز هنا (Copy as JSON / Copy as Header)</label>
+                  <textarea id="manualCookies" rows="4" placeholder="[{&quot;name&quot;:&quot;token&quot;,&quot;value&quot;:&quot;...&quot;}, ...]  OR  token=...; holdToken=...; refresh_token=...; cf_clearance=..."></textarea>
+                </div>
+              </div>
+              <div class="row">
+                <button id="addByTokenOrCookiesBtn" class="success">➕ إضافة للحجز</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="file-upload-row">
+          <label>أو اختر ملف txt (سطر لكل حساب بالصيغة username:password أو hold:token:email:password)</label>
+          <input type="file" id="accountsFile" accept="txt" />
+        </div>
+
+        <div class="row account-actions-bar">
+          <button id="selectAllAccountsBtn" type="button">تحديد الكل</button>
+          <button id="clearAccountsBtn" type="button">إلغاء الكل</button>
+          <button id="removeAllAccountsBtn" type="button" class="danger-text">حذف الكل</button>
+          <button id="loadAccountsBtn" type="button">📥 تحميل من الخادم</button>
+          <button id="saveAccountsBtn" type="button">💾 حفظ على الخادم</button>
+        </div>
+
+        <div id="accountsList" class="accounts-list"></div>
+        <div id="accountsSummary" class="summary">0 حساب محمل</div>
+      </section>
+
+      <!-- Team Selection -->
+      <section id="teamSelectionCard" class="card hidden">
+        <h2>⚽ اختيار الفريق <small>(للفعاليات الرياضية الخاصة)</small></h2>
+        <div id="teamsList" class="teams-list"></div>
+        <div id="teamSelectionHint" class="hint">اختر الفريق المفضل لإظهار الكراسي المخصصة له</div>
+      </section>
+
+      <!-- Sections Selection -->
+      <section class="card">
+        <h2>📋 الأقسام المتاحة <small>(اختر قسماً واحداً أو أكثر)</small></h2>
+        <div id="sectionsList" class="sections-list"></div>
+        <div id="selectionHint" class="hint">اختر قسماً واحداً على الأقل ليتم تفعيل زر بدء الحجز</div>
+      </section>
+    </div>
+
+    <!-- Proxies Tab -->
+    <div class="tab-content" id="tab-proxies">
+      <!-- Proxy Section -->
+      <section class="card">
+        <h2>🌐 البروكسيات</h2>
+        <p class="hint">سطر لكل بروكسي. الصيغ المدعومة: host:port | user:pass@host:port | http://user:pass@host:port | socks5://host:port | JSON</p>
+        <textarea id="proxyList" rows="4" placeholder="http://user:pass@proxy.example.com:8080&#10;socks5://proxy2.example.com:1080&#10;proxy3.example.com:3128"></textarea>
+        <div class="row">
+          <button id="saveProxiesBtn" type="button" class="success">💾 حفظ البروكسيات</button>
+          <button id="loadProxiesBtn" type="button" class="secondary">📥 تحميل البروكسيات</button>
+        </div>
+
+        <div class="proxy-toolbar">
+          <div class="proxy-toolbar-group">
+            <label for="proxyModeSelect">وضع البروكسي:</label>
+            <select id="proxyModeSelect">
+              <option value="off">⛔ Off (بدون بروكسي)</option>
+              <option value="test">🧪 Test (اختبار + fallback)</option>
+              <option value="required">🔒 Required (لازم بروكسي شغال)</option>
+            </select>
+            <span id="proxyModeStatus" style="color:var(--muted);font-size:0.9em;"></span>
+          </div>
+          <div class="proxy-toolbar-group">
+            <button id="testAllProxiesBtn" type="button" class="secondary">🧪 اختبار كل البروكسيات</button>
+            <button id="filterWorkingBtn" type="button" class="secondary">✅ اختبار + سيب الشغال بس</button>
+            <button id="loadDataJsonBtn" type="button" class="secondary">📂 تحميل data.json</button>
+          </div>
+          <div class="proxy-toolbar-group">
+            <label for="proxyFileInput" class="secondary file-label">📁 استيراد من ملف (txt / csv / json)</label>
+            <input type="file" id="proxyFileInput" accept=".txt,.csv,.json" style="display:none;" />
+            <span id="proxyFileName" style="color:var(--muted);font-size:0.9em;"></span>
+          </div>
+        </div>
+
+        <div class="proxy-add-row">
+          <div class="form-row">
+            <div class="form-group"><label>Host</label><input type="text" id="proxyHost" placeholder="31.59.20.176" /></div>
+            <div class="form-group small"><label>Port</label><input type="number" id="proxyPort" placeholder="6754" /></div>
+            <div class="form-group"><label>User</label><input type="text" id="proxyUser" placeholder="mhqchkft" /></div>
+            <div class="form-group"><label>Pass</label><input type="text" id="proxyPass" placeholder="xciz3pi4lwiu" /></div>
+          </div>
+          <div class="row">
+            <button id="addProxyBtn" type="button" class="success">➕ إضافة بروكسي</button>
+            <button id="clearProxiesBtn" type="button" class="danger-text">🗑️ مسح الكل</button>
+          </div>
+        </div>
+
+        <div id="proxiesList" class="proxies-list"></div>
+        <div id="proxiesSummary" class="summary">0 بروكسي محمل</div>
+      </section>
+    </div>
+
+    <!-- Settings Tab -->
+    <div class="tab-content" id="tab-settings">
+      <div class="grid two-col settings-grid">
+        <!-- Concurrency & Speed -->
+        <section class="card control-card">
+          <h2>⚡ الإعدادات</h2>
+
+          <label>عدد المتصفحات المتزامنة (0 = تلقائي)</label>
+          <input type="number" id="maxConcurrency" value="1" min="0" max="100" />
+          <div id="concurrencyHint" class="hint">سيفتح حساب واحد فقط في نفس الوقت</div>
+
+          <label>وضع السرعة</label>
+          <select id="speedModeSelect">
+            <option value="normal">عادي (آمن)</option>
+            <option value="fast" selected>سريع</option>
+            <option value="turbo">تيربو (أقصى سرعة)</option>
+          </select>
+          <div id="speedHint" class="hint">سريع: sniper كل 150ms | تيربو: sniper كل 80ms (احترس من الحظر)</div>
+        </section>
+
+        <!-- Pair Cycling Panel -->
+        <section class="card">
+          <div class="pair-cycling-panel">
+            <h3>🔄 Pair Cycling (تناوب الحجز)</h3>
+            <p class="hint">كل يوزرين يتناوبون على مسك نفس الكراسي كل 8 دقائق لمدة ساعة كحد أقصى.</p>
+            <div class="control-buttons">
+              <button id="startPairCyclingBtn" class="success big">🔄 بدء التناوب</button>
+              <button id="stopPairCyclingBtn" class="danger big">⛔ إيقاف التناوب</button>
+            </div>
+            <div id="pairCyclesStatus" class="pair-cycles-status hidden"></div>
+          </div>
+        </section>
+
+        <!-- 2captcha Keys -->
+        <section class="card">
+          <h2>🛡️ مفاتيح 2captcha</h2>
+          <p class="hint">الطريقة الأساسية لتجاوز الكابتشا تشتغل تلقائياً. 2captcha طبقة احتياطية يدوية/تلقائية لو الطريقة الأولى فشلت.</p>
+          <div id="captchaKeysList" class="captcha-keys-list"></div>
+          <div class="form-row" style="margin-top:10px;">
+            <input type="text" id="captchaKeyLabel" placeholder="اسم المفتاح (اختياري)" style="flex:1;" />
+            <input type="text" id="captchaKeyInput" placeholder="API Key من 2captcha.com" style="flex:2;" />
+            <button id="addCaptchaKeyBtn" class="success">➕ إضافة</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <footer class="dev-footer"><div class="dev-footer-inner"><span class="dev-avatar">👨‍💻</span><div class="dev-info"><strong>Egypt Code Craft</strong><span>✉️ egyptcodecraft@gmail.com</span></div></div></footer>
+
+  <script src="app.js?v=20260812"></script>
+</body>
+</html>

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kimiko Webook Booking Assistant</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <h1>🎫 Kimiko Webook Booking Assistant</h1>
+      <p class="subtitle">حجز آلي لمقاعد webook.com</p>
+    </header>
+
+    <!-- Status Dashboard -->
+    <section class="card dashboard">
+      <div class="dashboard-main">
+        <div class="status-pill">
+          <span id="statusBadge" class="badge idle">Idle</span>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-box">
+            <span class="stat-value" id="activeCount">0</span>
+            <span class="stat-label">نشط</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-value" id="pendingCount">0</span>
+            <span class="stat-label">في الانتظار</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-value" id="doneCount">0</span>
+            <span class="stat-label">اكتمل</span>
+          </div>
+          <div class="stat-box success">
+            <span class="stat-value" id="heldCount">0</span>
+            <span class="stat-label">مقاعد ممسوكة</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Content Grid -->
+    <div class="grid two-col">
+      <!-- Left Column -->
+      <div class="col">
+        <!-- Event URL Section -->
+        <section class="card">
+          <h2>🔗 رابط الفعالية</h2>
+          <input type="text" id="eventUrl" placeholder="https://webook.com/ar/sa/jed/music-events/events/.../book"
+            value="https://webook.com/ar/sa/jed/music-events/events/this-is-michael-musical-show-jeddah-tickets-2026/book" />
+          <div class="row">
+            <button id="fetchBtn" class="primary">🔍 جلب الأقسام</button>
+            <button id="refreshAvailabilityBtn" class="secondary">🔄 تحديث</button>
+          </div>
+          <div id="eventInfo" class="event-info hidden"></div>
+        </section>
+
+        <!-- Accounts Section -->
+        <section class="card">
+          <h2>👥 الحسابات</h2>
+
+          <div class="account-inputs">
+            <div class="form-row">
+              <div class="form-group">
+                <label>البريد الإلكتروني</label>
+                <input type="email" id="manualEmail" placeholder="example@email.com" value="tariqibrahim20@hotmail.com" />
+              </div>
+              <div class="form-group">
+                <label>كلمة المرور</label>
+                <input type="password" id="manualPassword" placeholder="••••••" value="Dd112233@" />
+              </div>
+            </div>
+            <div class="row">
+              <button id="addAccountBtn" class="success">➕ إضافة حساب</button>
+              <button id="addDefaultAccountBtn" class="secondary">استخدام الحساب الافتراضي</button>
+            </div>
+          </div>
+
+          <div class="file-upload-row">
+            <label>أو اختر ملف txt (سطر لكل حساب بالصيغة username:password)</label>
+            <input type="file" id="accountsFile" accept="txt" />
+          </div>
+
+          <div class="row account-actions-bar">
+            <button id="selectAllAccountsBtn" type="button">تحديد الكل</button>
+            <button id="clearAccountsBtn" type="button">إلغاء الكل</button>
+            <button id="removeAllAccountsBtn" type="button" class="danger-text">حذف الكل</button>
+            <button id="loadAccountsBtn" type="button">📥 تحميل من الخادم</button>
+            <button id="saveAccountsBtn" type="button">💾 حفظ على الخادم</button>
+          </div>
+
+          <div id="accountsList" class="accounts-list"></div>
+          <div id="accountsSummary" class="summary">0 حساب محمل</div>
+        </section>
+      </div>
+
+      <!-- Right Column -->
+      <div class="col">
+        <!-- Control Panel -->
+        <section class="card control-card">
+          <h2>⚙️ التحكم</h2>
+          
+          <label>عدد المتصفحات المتزامنة (0 = تلقائي)</label>
+          <input type="number" id="maxConcurrency" value="1" min="0" max="100" />
+          <div id="concurrencyHint" class="hint">سيفتح حساب واحد فقط في نفس الوقت</div>
+
+          <label>طريقة التوزيع</label>
+          <select id="ticketMode">
+            <option value="per-account">لكل حساب (30 لكل حساب)</option>
+            <option value="total">إجمالي مطلق (توزيع تلقائي)</option>
+            <option value="auto-split">توزيع ذكي حسب المتاح</option>
+          </select>
+
+          <label>عدد التذاكر لكل حساب</label>
+          <input type="number" id="ticketCount" value="30" min="1" />
+          <div id="ticketCountHint" class="hint">سيتم محاولة مسك 30 تذكرة لكل حساب</div>
+
+          <div class="control-buttons">
+            <button id="startBookingBtn" class="primary big">🚀 بدء الحجز</button>
+            <button id="stopBookingBtn" class="danger big">⛔ إيقاف الكل</button>
+          </div>
+
+          <hr class="section-divider" />
+
+          <div class="pair-cycling-panel">
+            <h3>🔄 Pair Cycling (تناوب الحجز)</h3>
+            <p class="hint">كل يوزرين يتناوبون على مسك نفس الكراسي كل 8 دقائق لمدة ساعة كحد أقصى.</p>
+            <div class="control-buttons">
+              <button id="startPairCyclingBtn" class="success big">🔄 بدء التناوب</button>
+              <button id="stopPairCyclingBtn" class="danger big">⛔ إيقاف التناوب</button>
+            </div>
+            <div id="pairCyclesStatus" class="pair-cycles-status hidden"></div>
+          </div>
+
+          <div class="row">
+            <button id="downloadLogsBtn" class="secondary">📥 تحميل السجل</button>
+            <button id="clearLogsBtn" class="secondary">🧹 مسح السجل</button>
+          </div>
+        </section>
+
+        <!-- Sections Selection -->
+        <section class="card">
+          <h2>📋 الأقسام المتاحة <small>(اختر قسماً واحداً أو أكثر)</small></h2>
+          <div id="sectionsList" class="sections-list"></div>
+          <div id="selectionHint" class="hint">اختر قسماً واحداً على الأقل ليتم تفعيل زر بدء الحجز</div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Logs Section -->
+    <section class="card">
+      <h2>📊 السجل</h2>
+      <div id="logs" class="logs"></div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
