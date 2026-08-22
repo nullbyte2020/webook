@@ -7,7 +7,9 @@ const os = require('os');
 const cors = require('cors');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
-const { chromium, devices, request: playwrightRequest } = require('playwright');
+const { chromium, devices, request: playwrightRequest } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+try { chromium.use(StealthPlugin()); } catch (e) { fileLog('WARN', `Stealth plugin init warning: ${e.message}`); }
 const WebSocket = require('ws');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { SocksProxyAgent } = require('socks-proxy-agent');
@@ -16,6 +18,24 @@ const { createAtomicQueue } = require('./secure_queue_middleware');
 const { createProxyManager } = require('./lib/proxy-manager');
 const captcha2captcha = require('./lib/captcha-2captcha');
 const humanInput = require('./lib/human-input');
+const {
+  isSensitiveKey,
+  redactValue,
+  safeRedactedStringify,
+  trimCache,
+  getProxyCacheKey,
+} = require('./lib/safety-helpers');
+const {
+  HeadlessSeatCloudClient,
+  headlessTransferV3,
+  headlessTransferBatch,
+  holdSeatsViaRest,
+  releaseSeatsViaRest,
+  verifyHeldSeats,
+  parseCookies,
+  fetchSeatcloudKeys,
+  getHoldTokenFromCookies,
+} = require('./headless-transfer-engine');
 
 // Secure queue token validator (reference implementation of the server-side
 // fixes for JWT bypass / queue race issues). See secure_queue_server.js for a
@@ -67,6 +87,16 @@ const DIAGNOSTICS_DIR = path.join(__dirname, 'logs', 'diagnostics');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 fs.mkdirSync(DIAGNOSTICS_DIR, { recursive: true });
 const LOG_FILE = path.join(LOG_DIR, `kimiko-${new Date().toISOString().slice(0, 10)}.log`);
+
+// Session cache for harvested full sessions (cookies + storageState + tokens)
+const SESSION_CACHE_DIR = path.join(__dirname, 'session_cache');
+(async () => {
+  try {
+    await fs.promises.mkdir(SESSION_CACHE_DIR, { recursive: true });
+  } catch (e) {
+    fileLog('WARN', `Could not create session cache dir: ${e.message}`);
+  }
+})();
 const LOG_MAX_BYTES = 100 * 1024 * 1024; // rotate if current log exceeds 100 MB
 function fileLog(level, message) {
   const line = `[${new Date().toISOString()}] [${level}] ${message}\n`;
@@ -106,9 +136,43 @@ function rotateLogIfNeeded() {
 }
 
 // ------------------------------------------------------------------
+// Structured transfer audit log
+// ------------------------------------------------------------------
+const TRANSFER_AUDIT_FILE = path.join(LOG_DIR, `transfer-audit-${new Date().toISOString().slice(0, 10)}.jsonl`);
+class TransferAuditor {
+  constructor() {
+    this.entries = [];
+  }
+  record(entry) {
+    const record = {
+      ts: new Date().toISOString(),
+      transferId: entry.transferId || `tx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      stage: entry.stage || 'unknown',
+      sourceUser: entry.sourceUser || null,
+      destinationUser: entry.destinationUser || null,
+      seats: entry.seats || [],
+      held: typeof entry.held === 'number' ? entry.held : null,
+      missing: typeof entry.missing === 'number' ? entry.missing : null,
+      mode: entry.mode || null,
+      durationMs: typeof entry.durationMs === 'number' ? entry.durationMs : null,
+      error: entry.error || null,
+      metadata: entry.metadata || {},
+    };
+    this.entries.push(record);
+    try {
+      fs.appendFileSync(TRANSFER_AUDIT_FILE, JSON.stringify(record) + '\n');
+    } catch (e) {
+      fileLog('WARN', `Transfer audit write failed: ${e.message}`);
+    }
+    return record.transferId;
+  }
+}
+const transferAuditor = new TransferAuditor();
+
+// ------------------------------------------------------------------
 // Remote kill switch
 // ------------------------------------------------------------------
-const KILL_SWITCH_URL = 'https://docs.google.com/uc?export=download&id=1WY1wnuQPy_NLeANIkmiDMH6BaEOWVn4Z';
+const KILL_SWITCH_URL = 'https://docs.google.com/uc?export=download&id=1REr8SgHM4oAWplpliRw2YH4oC_M-ACaN';
 
 async function checkKillSwitch() {
   const controller = new AbortController();
@@ -162,10 +226,77 @@ const proxyManager = createProxyManager({
 });
 const PROXY_TEST_CACHE = new Map(); // server -> { ok, reason, ts }
 const PROXY_TEST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const PROXY_TEST_CACHE_MAX_SIZE = 500;
+
+const CHART_SECTIONS_CACHE = new Map(); // slug -> { ts, result }
+const CHART_SECTIONS_CACHE_TTL_MS = 60 * 1000; // 60 seconds
 
 // Global shared queue token harvested by the first credentials account that
 // clears the waiting room. Follower accounts inject it to bypass the queue.
+// Stored as { token, harvestedAt, expiresAt } so we can expire stale tokens.
 let globalValidQueueToken = null;
+
+function getQueueTokenExp(queueToken) {
+  if (!queueToken || typeof queueToken !== 'string') return null;
+  try {
+    const parts = queueToken.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return payload && typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {}
+  return null;
+}
+
+function isQueueTokenValid(queueToken, bufferSeconds = 30) {
+  const exp = getQueueTokenExp(queueToken);
+  if (!exp) return true; // unknown expiry, treat as valid
+  return Date.now() < (exp * 1000 - bufferSeconds * 1000);
+}
+
+function setGlobalValidQueueToken(token) {
+  if (!token || typeof token !== 'string') return;
+  const exp = getQueueTokenExp(token);
+  globalValidQueueToken = {
+    token,
+    harvestedAt: Date.now(),
+    expiresAt: exp ? exp * 1000 : null,
+  };
+  fileLog('INFO', `[QUEUE-BYPASS] Harvested global queue token (expires ${exp ? new Date(exp * 1000).toISOString() : 'unknown'})`);
+}
+
+function broadcastQueueTokenToPending(token) {
+  if (!token || !pendingQueue.length) return;
+  let injected = 0;
+  for (const account of pendingQueue) {
+    if (!account.queueToken && !account.queueSession) {
+      account.queueToken = token;
+      account.queueSession = token;
+      injected++;
+    }
+  }
+  if (injected) {
+    fileLog('INFO', `[QUEUE-BYPASS] Broadcast queue token to ${injected} pending account(s)`);
+  }
+}
+
+async function tryInjectHarvestedQueueToken(session) {
+  if (!globalValidQueueToken || !globalValidQueueToken.token) return false;
+  if (!isQueueTokenValid(globalValidQueueToken.token)) {
+    fileLog('INFO', `[QUEUE-BYPASS] Harvested queue token expired; not injecting for ${session.username}`);
+    globalValidQueueToken = null;
+    return false;
+  }
+  if (session.queueToken || session.providedQueueToken) return false;
+  try {
+    await syncQueueTokenToCookie(session.context, globalValidQueueToken.token);
+    session.queueToken = globalValidQueueToken.token;
+    emitStatus('queue-token-injected', 'Injected harvested queue token before navigation', { account: session.username });
+    return true;
+  } catch (e) {
+    fileLog('WARN', `[QUEUE-BYPASS] Failed to inject queue token for ${session.username}: ${e.message}`);
+    return false;
+  }
+}
 
 async function testProxy(proxy, timeoutMs = 6000) {
   if (!proxy || !proxy.server) return { ok: false, reason: 'no proxy server', targets: [] };
@@ -217,6 +348,7 @@ async function testProxy(proxy, timeoutMs = 6000) {
     try { await requestContext.dispose(); } catch {}
   }
   PROXY_TEST_CACHE.set(cacheKey, result);
+  trimCache(PROXY_TEST_CACHE, PROXY_TEST_CACHE_MAX_SIZE);
   return result;
 }
 
@@ -230,71 +362,125 @@ function getActiveProxyKeys() {
   return keys;
 }
 
-async function assignProxiesToAccounts(accounts) {
-  // Pre-assign a unique, tested proxy to each account that opted-in.
-  // This prevents race conditions when multiple accounts start simultaneously.
+async function assignProxiesToAccounts(accounts, opts = {}) {
   const all = proxyManager.getAll();
-  if (!all.length) return;
-  const usedKeys = new Set();
   const result = [];
+  if (!all.length || currentProxyMode === 'off') {
+    for (const a of accounts) result.push({ ...a, assignedProxy: null });
+    return result;
+  }
+
+  const usedKeys = new Set([...getReservedProxyKeys(), ...getLaunchingProxyKeys(), ...getActiveProxyKeys()]);
+  const requiredUnique = accounts.filter(a => a.useProxy === true).length;
+
+  emitStatus('transfer-assigning-proxies', `Assigning unique proxies to ${accounts.length} account(s)`, {
+    totalProxies: all.length,
+    totalAccounts: accounts.length,
+    activeProxies: getActiveProxyKeys().size,
+  });
+
   for (const a of accounts) {
     if (a.useProxy !== true) {
       result.push({ ...a, assignedProxy: null });
       continue;
     }
     let assigned = null;
-    // Try to find an unused working proxy first.
+    // Prefer cached-working unused proxy
     for (const p of all) {
-      const key = `${p.server}|${p.username || ''}|${p.password || ''}`;
+      const key = getProxyCacheKey(p);
       if (usedKeys.has(key)) continue;
-      const test = await testProxy(p, 6000);
-      if (test.ok) {
+      const cached = PROXY_TEST_CACHE.get(key);
+      if (cached && cached.ok && Date.now() - cached.ts < PROXY_TEST_CACHE_TTL_MS) {
         usedKeys.add(key);
         assigned = p;
         break;
       }
     }
-    // If all unique proxies failed or exhausted, fall back to any working proxy.
     if (!assigned) {
       for (const p of all) {
-        const key = `${p.server}|${p.username || ''}|${p.password || ''}`;
+        const key = getProxyCacheKey(p);
         if (usedKeys.has(key)) continue;
-        const test = await testProxy(p, 4000);
-        if (test.ok) {
-          usedKeys.add(key);
-          assigned = p;
-          break;
-        }
+        usedKeys.add(key);
+        assigned = p;
+        break;
       }
+    }
+    if (!assigned && currentProxyMode === 'required') {
+      const err = new Error(`PROXY_EXHAUSTED: need ${requiredUnique} unique proxies but none free (total ${all.length})`);
+      fileLog('ERROR', `[assignProxiesToAccounts] ${err.message}`);
+      emitStatus('proxy-exhausted', err.message, { totalProxies: all.length, requiredUnique });
+      throw err;
+    }
+    if (!assigned) {
+      fileLog('WARN', `[assignProxiesToAccounts] No free proxy for ${a.username}; launching direct`);
     }
     result.push({ ...a, assignedProxy: assigned });
   }
+
+  const assignedCount = result.filter(r => r.assignedProxy).length;
+  emitStatus('transfer-proxies-assigned', `Assigned proxies to ${assignedCount}/${accounts.length} account(s)`, { assigned: assignedCount, total: accounts.length });
   return result;
 }
 
-async function findWorkingProxy(username) {
-  const all = proxyManager.getAll();
+async function findWorkingProxy(username, proxyList = null, opts = {}) {
+  // Use provided list first, otherwise fall back to the global pool for backwards
+  // compatibility with callers that do not pass a list.
+  const all = proxyList && proxyList.length ? proxyList : proxyManager.getAll();
   if (!all.length) return { proxy: null, tested: [] };
+
+  // Guard against runaway proxy testing: callers can cap total time and per-proxy time.
+  const maxTotalMs = typeof opts.maxTotalMs === 'number' ? opts.maxTotalMs : 30_000;
+  const perProxyTimeoutMs = typeof opts.perProxyTimeoutMs === 'number' ? opts.perProxyTimeoutMs : 6_000;
+  const deadline = Date.now() + maxTotalMs;
+
   const activeKeys = getActiveProxyKeys();
-  const preferred = proxyManager.resolveForAccount(username, 'stable-hash');
+  const preferred = proxyList && proxyList.length
+    ? null
+    : proxyManager.resolveForAccount(username, 'stable-hash');
   // Prefer proxies not currently in use by another active session.
   const unused = all.filter(p => {
     const key = `${p.server}|${p.username || ''}|${p.password || ''}`;
     return !activeKeys.has(key);
   });
-  const candidates = [preferred, ...unused, ...all];
+  const candidates = [preferred, ...unused, ...all].filter(Boolean);
   const seen = new Set();
   const tested = [];
+  for (const proxy of candidates) {
+    if (!proxy || !proxy.server) continue;
+    if (Date.now() > deadline) {
+      tested.push({ server: proxy.server, ok: false, reason: 'proxy-search-deadline-reached' });
+      fileLog('WARN', `[proxy-status] [${username}] findWorkingProxy stopped at deadline (${maxTotalMs}ms)`);
+      break;
+    }
+    const key = `${proxy.server}|${proxy.username || ''}|${proxy.password || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const remaining = Math.max(500, deadline - Date.now());
+    const test = await testProxy(proxy, Math.min(perProxyTimeoutMs, remaining));
+    tested.push({ server: proxy.server, ok: test.ok, reason: test.reason });
+    if (test.ok) return { proxy, tested };
+  }
+  return { proxy: null, tested };
+}
+
+// Find a working proxy for an account, with optional explicit list and global fallback.
+async function getWorkingProxyForAccount(username, proxyList = null) {
+  const preferred = proxyList || [];
+  const global = proxyManager.getAll();
+  const candidates = preferred.length > 0 ? [...preferred, ...global] : global;
+  const seen = new Set();
   for (const proxy of candidates) {
     if (!proxy || !proxy.server) continue;
     const key = `${proxy.server}|${proxy.username || ''}|${proxy.password || ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const test = await testProxy(proxy);
-    tested.push({ server: proxy.server, ok: test.ok, reason: test.reason });
-    if (test.ok) return { proxy, tested };
+    const test = await testProxy(proxy, 5000);
+    if (test.ok) {
+      fileLog('INFO', `[proxy-status] [${username}] Found working proxy: ${proxy.server}`);
+      return { proxy, tested: true };
+    }
   }
-  return { proxy: null, tested };
+  return { proxy: null, tested: false };
 }
 
 function logProxyStatus(username, state, server = null, mode = '') {
@@ -315,50 +501,102 @@ function logProxyStatus(username, state, server = null, mode = '') {
   });
 }
 
-async function resolveProxyForAccount(username, accountUseProxy = null) {
+async function resolveProxyForAccount(username, accountUseProxy = null, proxyList = null, opts = {}) {
   // Per-account explicit direct connection.
   if (accountUseProxy === false) {
     logProxyStatus(username, 'DIRECT (No Proxy)', null, 'off');
     return { proxy: null, tested: [], mode: 'off' };
   }
 
-  // Per-account explicit proxy: override global 'off' mode and force assignment.
-  if (accountUseProxy === true) {
-    const { proxy, tested } = await findWorkingProxy(username);
-    if (proxy) {
-      logProxyStatus(username, 'PROXY ENABLED', proxy.server, 'forced');
-      return { proxy, tested, mode: 'forced' };
-    }
-    if (tested.length) {
-      fileLog('WARN', `[proxy-status] [${username}] Forced proxy requested but all proxy tests failed: ${JSON.stringify(tested.map(t => `${t.server} -> ${t.reason}`))}`);
-    }
-    if (currentProxyMode === 'required') {
-      throw new Error(`FORCED_PROXY_REQUIRED_BUT_ALL_FAILED: ${tested.map(t => `${t.server}(${t.reason})`).join(', ')}`);
-    }
-    // Global mode allows fallback (off/test); land on direct but warn loudly.
-    logProxyStatus(username, 'DIRECT (No Proxy) [fallback: forced proxy unavailable]', null, currentProxyMode);
-    return { proxy: null, tested, mode: currentProxyMode };
-  }
-
-  // No per-account override: follow global mode.
-  if (currentProxyMode === 'off') {
+  const all = proxyList && proxyList.length ? proxyList : proxyManager.getAll();
+  if (!all.length) {
     logProxyStatus(username, 'DIRECT (No Proxy)', null, 'off');
     return { proxy: null, tested: [], mode: 'off' };
   }
 
-  const { proxy, tested } = await findWorkingProxy(username);
-  if (proxy) {
-    logProxyStatus(username, 'PROXY ENABLED', proxy.server, currentProxyMode);
-    return { proxy, tested, mode: currentProxyMode };
+  const mode = accountUseProxy === true ? 'forced' : (currentProxyMode === 'off' ? 'off' : currentProxyMode);
+  if (mode === 'off') {
+    logProxyStatus(username, 'DIRECT (No Proxy)', null, 'off');
+    return { proxy: null, tested: [], mode: 'off' };
   }
-  if (tested.length) {
-    fileLog('WARN', `[proxy-status] [${username}] All proxy tests failed: ${JSON.stringify(tested.map(t => `${t.server} -> ${t.reason}`))}`);
+
+  const activeKeys = getActiveProxyKeys();
+  const launchingKeys = getLaunchingProxyKeys();
+  const reservedKeys = getReservedProxyKeys();
+  const usedKeys = new Set([...activeKeys, ...launchingKeys, ...reservedKeys]);
+  const preferred = proxyManager.resolveForAccount(username, 'stable-hash');
+  const candidates = [preferred, ...all].filter(Boolean);
+  const seen = new Set();
+  for (const proxy of candidates) {
+    if (!proxy || !proxy.server) continue;
+    const key = getProxyCacheKey(proxy);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (usedKeys.has(key)) continue;
+    logProxyStatus(username, 'PROXY ENABLED', proxy.server, mode);
+    return { proxy, tested: [], mode };
   }
-  if (currentProxyMode === 'required') {
-    throw new Error(`PROXY_REQUIRED_BUT_ALL_FAILED: ${tested.map(t => `${t.server}(${t.reason})`).join(', ')}`);
+  if (mode === 'required' || mode === 'forced') {
+    const err = new Error(`PROXY_REQUIRED_BUT_ALL_IN_USE for ${username}`);
+    fileLog('ERROR', `[resolveProxyForAccount] ${err.message}`);
+    throw err;
   }
-  logProxyStatus(username, 'DIRECT (No Proxy) [fallback: no working proxy]', null, 'test');
-  return { proxy: null, tested, mode: currentProxyMode };
+  logProxyStatus(username, 'DIRECT (No Proxy) [fallback: no proxy available]', null, mode);
+  return { proxy: null, tested: [], mode };
+}
+
+// ------------------------------------------------------------------
+// Periodic proxy health monitoring
+// ------------------------------------------------------------------
+let proxyHealthMonitorTimer = null;
+const PROXY_HEALTH_INTERVAL_MS = 60_000;
+
+async function monitorActiveProxyHealth() {
+  if (currentProxyMode === 'off') return;
+  const usedProxies = new Map(); // cacheKey -> { proxy, usernames: [] }
+  for (const [username, session] of activeSessions.entries()) {
+    if (!session.proxy) continue;
+    const key = getProxyCacheKey(session.proxy);
+    const entry = usedProxies.get(key) || { proxy: session.proxy, usernames: [] };
+    entry.usernames.push(username);
+    usedProxies.set(key, entry);
+  }
+
+  for (const { proxy, usernames } of usedProxies.values()) {
+    const key = getProxyCacheKey(proxy);
+    const result = await testProxy(proxy, 2000);
+    if (!result.ok) {
+      PROXY_TEST_CACHE.set(key, { ...result, ts: Date.now() });
+      fileLog('WARN', `[proxy-health] Proxy ${proxy.server} is unhealthy (${result.reason}); affected accounts: ${usernames.join(', ')}`);
+      emitStatus('proxy-unhealthy', `البروكسي ${proxy.server} توقف عن العمل (${result.reason})`, { proxy: proxy.server, accounts: usernames, reason: result.reason });
+      for (const username of usernames) {
+        const session = activeSessions.get(username);
+        if (session && ['idle', 'paused', 'error'].includes(session.state)) {
+          // Try to find a replacement proxy for accounts that are not actively selecting.
+          try {
+            const resolved = await resolveProxyForAccount(username, session.proxyMode === 'forced' ? true : null);
+            if (resolved.proxy && getProxyCacheKey(resolved.proxy) !== key) {
+              session.proxy = resolved.proxy;
+              session.proxyMode = resolved.mode;
+              emitStatus('proxy-replaced', `تم استبدال البروكسي لـ ${username}: ${resolved.proxy.server}`, { account: username, proxy: resolved.proxy.server, oldProxy: proxy.server });
+            }
+          } catch (e) {
+            fileLog('WARN', `[proxy-health] Could not replace proxy for ${username}: ${e.message}`);
+          }
+        } else if (session) {
+          emitStatus('proxy-warning', `البروكسي لـ ${username} غير صحي لكن الحساب نشط حالياً`, { account: username, proxy: proxy.server, reason: result.reason, state: session.state });
+        }
+      }
+    }
+  }
+}
+
+function startProxyHealthMonitor() {
+  if (proxyHealthMonitorTimer) return;
+  proxyHealthMonitorTimer = setInterval(() => {
+    monitorActiveProxyHealth().catch(err => fileLog('WARN', `[proxy-health] Monitor error: ${err.message}`));
+  }, PROXY_HEALTH_INTERVAL_MS);
+  proxyHealthMonitorTimer.unref?.();
 }
 
 function detectSharedHoldTokens(accounts, label = 'booking') {
@@ -813,6 +1051,504 @@ function deleteSessionFile(username) {
   }
 }
 
+// ------------------------------------------------------------------
+// Full session cache (cookies + localStorage + sessionStorage + storageState)
+// ------------------------------------------------------------------
+
+function sessionCacheFilePath(username) {
+  const safeUsername = String(username).replace(/[@.]/g, '_');
+  return path.join(SESSION_CACHE_DIR, `${safeUsername}.json`);
+}
+
+async function harvestFullSession(page, context, username) {
+  fileLog('INFO', `[session-harvest] Extracting full session for ${username}`);
+  try {
+    const cookies = await context.cookies();
+    const localStorage = await page.evaluate(() => {
+      const data = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        try { data[key] = localStorage.getItem(key); } catch (e) {}
+      }
+      return data;
+    });
+    const sessionStorage = await page.evaluate(() => {
+      const data = {};
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        try { data[key] = sessionStorage.getItem(key); } catch (e) {}
+      }
+      return data;
+    });
+    const storageState = await context.storageState();
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => '');
+    const viewport = page.viewportSize() || { width: 1366, height: 768 };
+
+    const fullSession = {
+      username,
+      timestamp: Date.now(),
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      cookies,
+      localStorage,
+      sessionStorage,
+      storageState,
+      userAgent,
+      viewport,
+      url: page.url(),
+    };
+    await saveSessionToCache(username, fullSession);
+    fileLog('INFO', `[session-harvest] ✅ Full session saved for ${username} (${cookies.length} cookies, ${Object.keys(localStorage).length} LS, ${Object.keys(sessionStorage).length} SS)`);
+    return fullSession;
+  } catch (err) {
+    fileLog('ERROR', `[session-harvest] Failed to extract session for ${username}: ${err.message}`);
+    throw err;
+  }
+}
+
+async function saveSessionToCache(username, session) {
+  const filePath = sessionCacheFilePath(username);
+  await fs.promises.writeFile(filePath, JSON.stringify(session, null, 2), 'utf8');
+}
+
+async function loadSessionFromCache(username) {
+  const filePath = sessionCacheFilePath(username);
+  try {
+    const data = await fs.promises.readFile(filePath, 'utf8');
+    const session = JSON.parse(data);
+    if (session.expiresAt && session.expiresAt < Date.now()) {
+      fileLog('WARN', `[session-cache] Session expired for ${username}`);
+      return null;
+    }
+    return session;
+  } catch (err) {
+    return null;
+  }
+}
+
+function validateSession(session) {
+  if (!session || !session.storageState) return false;
+  const hasAccessToken = !!(session.localStorage?.accessToken ||
+    session.sessionStorage?.accessToken ||
+    session.cookies?.some(c => c.name.includes('session') || c.name.includes('token')));
+  if (!hasAccessToken) {
+    fileLog('WARN', `[session-validate] No access token found in session for ${session.username}`);
+    return false;
+  }
+  return true;
+}
+
+const SESSION_HARVEST_COOLDOWN_MS = 5 * 60 * 1000;
+const lastHarvestTime = new Map();
+
+async function autoHarvestSession(page, context, username) {
+  const last = lastHarvestTime.get(username) || 0;
+  if (Date.now() - last < SESSION_HARVEST_COOLDOWN_MS) {
+    fileLog('INFO', `[session-harvest] Skipping auto-harvest for ${username}; cooldown active`);
+    return null;
+  }
+  try {
+    const fullSession = await harvestFullSession(page, context, username);
+    lastHarvestTime.set(username, Date.now());
+    emitStatus('session-harvested', 'Session auto-harvested after login', {
+      account: username,
+      cookiesCount: fullSession.cookies.length,
+      localStorageCount: Object.keys(fullSession.localStorage || {}).length,
+      sessionStorageCount: Object.keys(fullSession.sessionStorage || {}).length,
+    });
+    return fullSession;
+  } catch (err) {
+    fileLog('WARN', `[session-harvest] Auto-harvest failed for ${username}: ${err.message}`);
+    return null;
+  }
+}
+
+async function createSessionWithContext(fullSession, options = {}) {
+  const { targetUrl, proxy } = options;
+  const username = fullSession.username;
+  fileLog('INFO', `[session-inject] Creating new context for ${username} with harvested session`);
+
+  try {
+    const browser = await ensureBrowser();
+    const contextOptions = {
+      storageState: fullSession.storageState,
+      userAgent: fullSession.userAgent || randomChartFriendlyProfile().userAgent,
+      viewport: fullSession.viewport || { width: 1366, height: 768 },
+      locale: 'ar-SA',
+      timezoneId: 'Asia/Riyadh',
+      geolocation: { latitude: 24.7136, longitude: 46.6753 },
+      permissions: ['geolocation', 'storage-access'],
+    };
+    if (proxy && proxy.server) {
+      contextOptions.proxy = {
+        server: proxy.server,
+        username: proxy.username,
+        password: proxy.password,
+      };
+    }
+
+    const context = await browser.newContext(contextOptions);
+    allContexts.add(context);
+    context.on('close', () => allContexts.delete(context));
+
+    // Inject stealth anti-detection script into every page created in this context.
+    try {
+      const stealthProfile = {
+        userAgent: contextOptions.userAgent,
+        languages: ['ar-SA', 'ar', 'en-US', 'en'],
+        isMobile: false,
+        platform: 'Windows',
+      };
+      const stealthScript = generateStealthScript(stealthProfile);
+      await context.addInitScript(stealthScript);
+    } catch (stealthErr) {
+      fileLog('WARN', `[session-inject] Stealth init script failed for ${username}: ${stealthErr.message}`);
+    }
+
+    const page = await context.newPage();
+
+    // Manual fallback: inject localStorage and sessionStorage items if Playwright
+    // storageState did not restore them (some sites use JS-only storage).
+    const hasLs = fullSession.localStorage && Object.keys(fullSession.localStorage).length > 0;
+    const hasSs = fullSession.sessionStorage && Object.keys(fullSession.sessionStorage).length > 0;
+    if (hasLs || hasSs) {
+      const injectionUrl = targetUrl || fullSession.url || 'https://webook.com/';
+      await page.goto(injectionUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      if (hasLs) {
+        await page.evaluate((lsData) => {
+          Object.entries(lsData).forEach(([key, value]) => {
+            try { localStorage.setItem(key, value); } catch (e) {}
+          });
+        }, fullSession.localStorage);
+      }
+      if (hasSs) {
+        await page.evaluate((ssData) => {
+          Object.entries(ssData).forEach(([key, value]) => {
+            try { sessionStorage.setItem(key, value); } catch (e) {}
+          });
+        }, fullSession.sessionStorage);
+      }
+      fileLog('INFO', `[session-inject] Injected ${Object.keys(fullSession.localStorage || {}).length} LS + ${Object.keys(fullSession.sessionStorage || {}).length} SS items for ${username}`);
+    }
+
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    const isValid = await validateInjectedSession(page, username);
+    fileLog('INFO', `[session-inject] Context ready for ${username}: isValid=${isValid}`);
+    return { context, page, isValid };
+  } catch (err) {
+    fileLog('ERROR', `[session-inject] Failed to create context for ${username}: ${err.message}`);
+    throw err;
+  }
+}
+
+async function validateInjectedSession(page, username) {
+  try {
+    await page.waitForTimeout(1500);
+    const { isLoggedIn, hasToken } = await page.evaluate(() => {
+      const userElements = document.querySelectorAll('[class*="user"], [class*="profile"], [class*="avatar"], [data-testid*="user"]');
+      const loginButtons = document.querySelectorAll('[class*="login"], [class*="signin"]');
+      return {
+        isLoggedIn: userElements.length > 0 && loginButtons.length === 0,
+        hasToken: !!(localStorage.getItem('accessToken') || localStorage.getItem('token') || localStorage.getItem('auth')),
+      };
+    });
+    const isValid = isLoggedIn || hasToken;
+    fileLog('INFO', `[session-validate] ${username}: isLoggedIn=${isLoggedIn}, hasToken=${hasToken}, isValid=${isValid}`);
+    return isValid;
+  } catch (err) {
+    fileLog('ERROR', `[session-validate] Validation error for ${username}: ${err.message}`);
+    return false;
+  }
+}
+
+// ------------------------------------------------------------------
+// Transfer Engine v3 - full session harvesting + holdToken migration
+// ------------------------------------------------------------------
+
+async function extractHoldToken(page) {
+  try {
+    const token = await page.evaluate(() => {
+      return sessionStorage.getItem('holdToken') ||
+             sessionStorage.getItem('seatHoldToken') ||
+             sessionStorage.getItem('sc_hold_token') ||
+             localStorage.getItem('holdToken') ||
+             localStorage.getItem('seatHoldToken');
+    });
+    if (token) return token;
+    // Fallback: try to read from chart state if available.
+    const frame = await findChartFrame(page, null, { emit: false });
+    if (frame) {
+      const chartToken = await frame.evaluate(() => {
+        return window.holdToken || window.__kimikoForcedHoldToken || null;
+      }).catch(() => null);
+      if (chartToken) return chartToken;
+    }
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function navigateToBookingPage(page, url, username) {
+  try {
+    const normalized = String(url).replace(/\/$/, '');
+    const bookUrl = normalized.endsWith('/book') ? normalized : `${normalized}/book`;
+    await page.goto(bookUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForSelector('iframe[src*="seatcloud"]', { timeout: 30000 });
+    fileLog('INFO', `[navigate-v3] ${username} reached booking page with chart`);
+    return true;
+  } catch (err) {
+    throw new Error(`Navigation failed: ${err.message}`);
+  }
+}
+
+async function performHoldMigration(frame, seats, holdToken, username) {
+  try {
+    const result = await frame.evaluate(async (seatsData, token) => {
+      if (typeof window.seatingChart !== 'undefined') {
+        try {
+          await window.seatingChart.selectObjects(seatsData);
+          const currentHold = await window.seatingChart.getHoldToken();
+          return { success: true, holdToken: currentHold || token, selectedSeats: seatsData };
+        } catch (err) {
+          return { success: false, error: err.message };
+        }
+      }
+      return { success: false, error: 'seatingChart not available' };
+    }, seats, holdToken);
+
+    if (result.success) {
+      return { success: true, transferredCount: seats.length, failedCount: 0, holdToken: result.holdToken };
+    }
+    throw new Error(result.error);
+  } catch (err) {
+    fileLog('WARN', `[hold-migration] ${username}: ${err.message}`);
+    return { success: false, transferredCount: 0, failedCount: seats.length, error: err.message };
+  }
+}
+
+async function releaseSeatsFromSource(page, seats) {
+  try {
+    await page.evaluate((seatsData) => {
+      if (typeof window.seatingChart !== 'undefined') {
+        try { window.seatingChart.deselectObjects(seatsData); } catch (e) {}
+      }
+    }, seats);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+async function holdSeatsInDestination(page, seats) {
+  try {
+    const chartFrame = await page.$('iframe[src*="seatcloud"]');
+    if (!chartFrame) return { success: false, error: 'Chart iframe not found' };
+    const frame = await chartFrame.contentFrame();
+    if (!frame) return { success: false, error: 'Could not access chart iframe' };
+    const result = await frame.evaluate(async (seatsData) => {
+      if (typeof window.seatingChart !== 'undefined') {
+        try {
+          await window.seatingChart.selectObjects(seatsData);
+          return { success: true, heldSeats: seatsData };
+        } catch (err) {
+          return { success: false, error: err.message };
+        }
+      }
+      return { success: false, error: 'seatingChart not available' };
+    }, seats);
+    return result;
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+async function performFallbackTransfer(sourcePage, destPage, seats, username) {
+  fileLog('INFO', `[fallback-v3] ${username}: falling back to traditional release+hold`);
+  try {
+    const [releaseResult, holdResult] = await Promise.all([
+      releaseSeatsFromSource(sourcePage, seats),
+      new Promise((resolve) => {
+        setTimeout(async () => {
+          const result = await holdSeatsInDestination(destPage, seats);
+          resolve(result);
+        }, 5);
+      }),
+    ]);
+    if (holdResult.success) {
+      return { success: true, transferredCount: holdResult.heldSeats?.length || 0, failedCount: seats.length - (holdResult.heldSeats?.length || 0) };
+    }
+    return { success: false, transferredCount: 0, failedCount: seats.length, error: holdResult.error || 'Hold failed' };
+  } catch (err) {
+    return { success: false, transferredCount: 0, failedCount: seats.length, error: err.message };
+  }
+}
+
+async function performAtomicTransferV3(sourcePage, destPage, seats, sourceHoldToken, username) {
+  fileLog('INFO', `[atomic-v3] Starting atomic transfer of ${seats.length} seats to ${username}`);
+  const startTime = Date.now();
+  try {
+    if (!sourceHoldToken) {
+      fileLog('WARN', `[atomic-v3] No source holdToken for ${username}, falling back`);
+      return await performFallbackTransfer(sourcePage, destPage, seats, username);
+    }
+
+    await destPage.evaluate((token) => {
+      sessionStorage.setItem('holdToken', token);
+      sessionStorage.setItem('seatHoldToken', token);
+      sessionStorage.setItem('sc_hold_token', token);
+      localStorage.setItem('holdToken', token);
+      localStorage.setItem('seatHoldToken', token);
+    }, sourceHoldToken);
+
+    await destPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await destPage.waitForSelector('iframe[src*="seatcloud"]', { timeout: 20000 });
+
+    const chartFrame = await destPage.$('iframe[src*="seatcloud"]');
+    if (!chartFrame) throw new Error('Chart iframe not found');
+    const frame = await chartFrame.contentFrame();
+
+    emitStatus('transfer-batch-start', `Atomic transfer to ${username}`, { to: username, seats });
+    const result = await performHoldMigration(frame, seats, sourceHoldToken, username);
+    const elapsed = Date.now() - startTime;
+    fileLog('INFO', `[atomic-v3] ${username}: completed in ${elapsed}ms, success=${result.success}`);
+    emitStatus('transfer-batch-complete', `Atomic transfer to ${username}`, { to: username, held: result.success ? seats : [], missing: result.success ? [] : seats });
+
+    if (!result.success) {
+      return await performFallbackTransfer(sourcePage, destPage, seats, username);
+    }
+    return result;
+  } catch (err) {
+    fileLog('ERROR', `[atomic-v3] ${username}: ${err.message}`);
+    return await performFallbackTransfer(sourcePage, destPage, seats, username);
+  }
+}
+
+async function transferEngineV3(plan, options) {
+  const { url, targetSections, maxConcurrency: concurrency = 3 } = options;
+  const startTime = Date.now();
+  const masterUsernames = Array.isArray(plan.masterUsernames) ? plan.masterUsernames : [];
+  const sourceUsername = masterUsernames[0];
+
+  fileLog('INFO', `[transfer-v3] ═══ Starting Transfer Engine v3 ═══`);
+  fileLog('INFO', `[transfer-v3] Destinations: ${plan.destinations?.length || 0}`);
+
+  // Phase 1: Load sessions from cache.
+  const sessionMap = new Map();
+  const sourceSession = sourceUsername ? await loadSessionFromCache(sourceUsername) : null;
+  if (!sourceSession) throw new Error(`No cached session for source: ${sourceUsername}`);
+  sessionMap.set(sourceUsername, sourceSession);
+
+  for (const dest of plan.destinations || []) {
+    const destSession = await loadSessionFromCache(dest.username);
+    if (destSession) {
+      sessionMap.set(dest.username, destSession);
+    } else {
+      fileLog('WARN', `[transfer-v3] No cached session for ${dest.username}`);
+    }
+  }
+
+  // Phase 2: Create destination contexts in parallel (bounded concurrency).
+  const readyContexts = [];
+  const destEntries = Array.from(sessionMap.entries()).filter(([u]) => u !== sourceUsername);
+  const limit = Math.max(1, concurrency || 3);
+  for (let i = 0; i < destEntries.length; i += limit) {
+    const batch = destEntries.slice(i, i + limit);
+    const batchResults = await Promise.all(batch.map(async ([username, fullSession]) => {
+      emitStatus('destination-preparing', `Preparing destination ${username} via session injection`, {
+        account: username,
+        totalDestinations: destEntries.length,
+        currentIndex: i + batch.indexOf([username, fullSession]) + 1,
+      });
+      try {
+        const { context, page, isValid } = await createSessionWithContext(fullSession, { targetUrl: url });
+        if (!isValid) {
+          fileLog('WARN', `[transfer-v3] Context invalid for ${username}`);
+          try { await context.close(); } catch {}
+          return null;
+        }
+        return { username, context, page, fullSession };
+      } catch (err) {
+        fileLog('ERROR', `[transfer-v3] Context creation failed for ${username}: ${err.message}`);
+        return null;
+      }
+    }));
+    for (const r of batchResults) if (r) readyContexts.push(r);
+  }
+
+  if (readyContexts.length === 0) throw new Error('No destination contexts ready');
+
+  // Phase 3: Navigate all contexts to booking page in parallel.
+  await Promise.all(readyContexts.map(({ page, username }) =>
+    navigateToBookingPage(page, url, username).catch(err => {
+      fileLog('ERROR', `[transfer-v3] Navigation failed for ${username}: ${err.message}`);
+      return null;
+    })
+  ));
+
+  // Phase 4: Extract source holdToken and perform atomic transfers in parallel.
+  const sourcePage = activeSessions.get(sourceUsername)?.page;
+  if (!sourcePage) throw new Error('Source page not found in active sessions');
+  const sourceHoldToken = await extractHoldToken(sourcePage);
+  fileLog('INFO', `[transfer-v3] Source holdToken: ${sourceHoldToken ? sourceHoldToken.slice(0, 12) + '...' : 'none'}`);
+
+  const transferResults = [];
+  let totalTransferred = 0;
+  let totalFailed = 0;
+
+  const transferPromises = readyContexts.map(async ({ page, username }) => {
+    const destPlan = (plan.destinations || []).find(d => d.username === username);
+    if (!destPlan || !destPlan.assignedSeats?.length) return null;
+
+    emitStatus('destination-ready', `Destination ${username} ready for atomic transfer`, { account: username });
+    const result = await performAtomicTransferV3(sourcePage, page, destPlan.assignedSeats, sourceHoldToken, username);
+    transferResults.push({ destination: username, ...result });
+    if (result.success) {
+      totalTransferred += result.transferredCount || 0;
+    } else {
+      totalFailed += result.failedCount || destPlan.assignedSeats.length;
+    }
+    return result;
+  });
+
+  await Promise.all(transferPromises);
+
+  // Phase 5: Cleanup (contexts are kept open intentionally for possible reuse).
+  const elapsed = Date.now() - startTime;
+  fileLog('INFO', `[transfer-v3] ═══ Complete: ${totalTransferred} transferred, ${totalFailed} failed, ${elapsed}ms ═══`);
+
+  emitStatus('transfer-done', {
+    totalTransferred,
+    totalFailed,
+    details: transferResults,
+    elapsedMs: elapsed,
+  });
+
+  return {
+    success: totalFailed === 0,
+    totalTransferred,
+    totalFailed,
+    details: transferResults,
+    elapsedMs: elapsed,
+  };
+}
+
+function touchHoldToken(session, token, ttlMinutes = HOLD_TOKEN_EXTENSION_MINUTES, serverExpiresAt = null) {
+  if (!session) return;
+  session.holdToken = token || session.holdToken || null;
+  if (session.holdToken) {
+    session.holdTokenCreatedAt = session.holdTokenCreatedAt || Date.now();
+    session.holdTokenFirstCreatedAt = session.holdTokenFirstCreatedAt || session.holdTokenCreatedAt;
+    if (serverExpiresAt) {
+      session.holdTokenExpiresAt = new Date(serverExpiresAt).getTime();
+    } else {
+      session.holdTokenExpiresAt = Date.now() + Math.max(1, ttlMinutes) * 60 * 1000;
+    }
+  } else {
+    session.holdTokenCreatedAt = null;
+    session.holdTokenExpiresAt = null;
+  }
+}
+
 async function forceLogout(page, username) {
   emitStatus('logout', 'Forcing logout and clearing session...', { account: username });
   try {
@@ -864,8 +1600,9 @@ const WS_INTERCEPT = `
 // frontend never enforces the default 5-seat cap.
 const CHART_LIMIT_PATCH = `
 (() => {
+  const LIMIT_VALUE = 150;
   const LIMIT_KEYS = ['maxNumberOfHolds','maxSelectedObjects','maxNumberOfSelectedObjects','maxObjects','maxSeats','selectionLimit','holdLimit','maxHold','maxSelection','maxPerOrder','max_per_order','maxTickets','maxTicketCount','ticketLimit','purchaseLimit','event_order_limit','season_order_limit','order_limit'];
-  function patchLimits(obj, value = 100) {
+  function patchLimits(obj, value = LIMIT_VALUE) {
     if (!obj || typeof obj !== 'object') return;
     for (const key of LIMIT_KEYS) {
       if (key in obj) {
@@ -883,50 +1620,88 @@ const CHART_LIMIT_PATCH = `
     }
     if (obj.config && typeof obj.config === 'object') patchLimits(obj.config, value);
   }
+  function patchChartInstance(chart) {
+    if (!chart || chart.__kimikoLimitPatched) return;
+    chart.__kimikoLimitPatched = true;
+    patchLimits(chart.state);
+    patchLimits(chart.config);
+    patchLimits(chart._config);
+    patchLimits(chart.options);
+    if (chart.state) {
+      if (typeof chart.state._selectionCount === 'number') chart.state._selectionCount = 0;
+      if (typeof chart.state._holdCount === 'number') chart.state._holdCount = 0;
+      if (typeof chart.state.heldCount === 'number') chart.state.heldCount = 0;
+      if (!Array.isArray(chart.state.selectedObjects)) chart.state.selectedObjects = [];
+      if (!Array.isArray(chart.state.heldObjects)) chart.state.heldObjects = [];
+    }
+    // Proxy selectObjects so limits are re-applied immediately before every selection.
+    if (typeof chart.selectObjects === 'function' && !chart.selectObjects.__kimikoPatched) {
+      const orig = chart.selectObjects;
+      chart.selectObjects = function (...args) {
+        patchLimits(chart.state);
+        patchLimits(chart.config);
+        patchLimits(chart.options);
+        return orig.apply(this, args);
+      };
+      chart.selectObjects.__kimikoPatched = true;
+    }
+    // Proxy render/draw to force limits before each render.
+    ['render','redraw','draw','rerender'].forEach(method => {
+      if (typeof chart[method] === 'function' && !chart[method].__kimikoPatched) {
+        const orig = chart[method];
+        chart[method] = function (...args) {
+          patchLimits(chart.state);
+          patchLimits(chart.config);
+          patchLimits(chart.options);
+          return orig.apply(this, args);
+        };
+        chart[method].__kimikoPatched = true;
+      }
+    });
+  }
   function patchCurrent() {
     patchLimits(window.chartState);
     patchLimits(window.currentChartConfig);
     patchLimits(window.seatsioConfig);
     patchLimits(window.seatsio?.config);
     const chart = window.chartRender || window.chart || window.SeatsChart || (window.seatsio && window.seatsio.chart);
-    if (chart) {
-      patchLimits(chart.state);
-      patchLimits(chart.config);
-      patchLimits(chart._config);
-      patchLimits(chart.options);
-      if (chart.state) {
-        if (typeof chart.state._selectionCount === 'number') chart.state._selectionCount = 0;
-        if (typeof chart.state._holdCount === 'number') chart.state._holdCount = 0;
-        if (typeof chart.state.heldCount === 'number') chart.state.heldCount = 0;
-        if (!Array.isArray(chart.state.selectedObjects)) chart.state.selectedObjects = [];
-        if (!Array.isArray(chart.state.heldObjects)) chart.state.heldObjects = [];
-      }
-    }
+    if (chart) patchChartInstance(chart);
   }
   function hookConstructor() {
     const seatsio = window.seatsio;
     if (!seatsio || typeof seatsio.SeatingChart !== 'function' || seatsio.SeatingChart.__kimikoPatched) return false;
     const Original = seatsio.SeatingChart;
     seatsio.SeatingChart = function SeatingChartPatched(config) {
-      // Session mode is required for the chart to visually mark selected/hold seats
-      // with checkmarks and keep them clickable for the current token.
       if (config && typeof config === 'object') {
         if (!config.session) config.session = 'continue';
-        patchLimits(config, 100);
+        patchLimits(config, LIMIT_VALUE);
+        // Define getters/setters on config so the bundle cannot reset limits later.
+        for (const key of LIMIT_KEYS) {
+          if (key in config) {
+            try {
+              Object.defineProperty(config, key, {
+                configurable: true,
+                get() { return LIMIT_VALUE; },
+                set(v) {}
+              });
+            } catch (e) {}
+          }
+        }
       }
       const instance = Original.call(this, config);
+      if (instance) patchChartInstance(instance);
       setTimeout(patchCurrent, 0);
-      setTimeout(patchCurrent, 250);
+      setTimeout(patchCurrent, 100);
+      setTimeout(patchCurrent, 500);
       return instance;
     };
     seatsio.SeatingChart.prototype = Original.prototype;
     seatsio.SeatingChart.__kimikoPatched = true;
     Object.setPrototypeOf(seatsio.SeatingChart, Original);
-    // Also patch the designer if it exists.
     if (typeof seatsio.SeatingChartDesigner === 'function' && !seatsio.SeatingChartDesigner.__kimikoPatched) {
       const OriginalDesigner = seatsio.SeatingChartDesigner;
       seatsio.SeatingChartDesigner = function SeatingChartDesignerPatched(config) {
-        patchLimits(config, 100);
+        patchLimits(config, LIMIT_VALUE);
         return OriginalDesigner.call(this, config);
       };
       seatsio.SeatingChartDesigner.prototype = OriginalDesigner.prototype;
@@ -935,18 +1710,34 @@ const CHART_LIMIT_PATCH = `
     }
     return true;
   }
+  function observeDom() {
+    if (typeof MutationObserver !== 'function' || window.__kimikoObserver) return;
+    window.__kimikoObserver = new MutationObserver(() => {
+      patchCurrent();
+      const chart = window.chartRender || window.chart || window.SeatsChart || (window.seatsio && window.seatsio.chart);
+      if (chart) patchChartInstance(chart);
+    });
+    window.__kimikoObserver.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true });
+  }
   function waitAndHook() {
-    if (hookConstructor()) return;
+    if (hookConstructor()) {
+      observeDom();
+      return;
+    }
     let attempts = 0;
     const timer = setInterval(() => {
       attempts++;
-      if (hookConstructor() || attempts > 300) clearInterval(timer);
+      if (hookConstructor()) {
+        observeDom();
+        clearInterval(timer);
+      }
+      if (attempts > 300) clearInterval(timer);
     }, 50);
   }
   waitAndHook();
   patchCurrent();
-  setInterval(patchCurrent, 500);
-  if (typeof window !== 'undefined') window.__kimikoChartLimitPatch = { patchCurrent, hookConstructor, patchLimits };
+  setInterval(patchCurrent, 250);
+  if (typeof window !== 'undefined') window.__kimikoChartLimitPatch = { patchCurrent, hookConstructor, patchLimits, patchChartInstance };
 })();
 `;
 
@@ -970,6 +1761,12 @@ const WB_ORIGIN = 'https://webook.com';
 // Browser & session management
 const ESTIMATED_RAM_PER_CONTEXT_MB = 280;
 const KEEPALIVE_INTERVAL_MS = 8_000;
+// Only auto-renew the hold token when the booking-page countdown drops below
+// this many seconds. SeatCloud holds are short-lived; extending earlier (60s)
+// gives the keepalive loop enough time to retry if the first extension fails.
+// Both values can be overridden via env.
+const HOLD_TOKEN_RENEW_THRESHOLD_SECONDS = parseInt(process.env.HOLD_TOKEN_RENEW_THRESHOLD_SECONDS, 10) || 60;
+const HOLD_TOKEN_EXTENSION_MINUTES = parseInt(process.env.HOLD_TOKEN_EXTENSION_MINUTES, 10) || 15;
 let globalBrowser = null;
 let activeSessions = new Map();
 let allContexts = new Set(); // Track every context ever opened for cleanup
@@ -978,30 +1775,61 @@ let maxConcurrency = 0;
 let sessionCounter = 0;
 let pairManager = null; // filled in below after createPairCyclingManager
 const transferLocks = new Set(); // serialize seat transfers per source account
+const activeProxyReservations = new Map(); // proxyCacheKey -> username
+const launchingProxyKeys = new Set();      // proxies reserved while context is being created
+const activeHoldTokenRegistry = new Map(); // holdToken -> username
+const globalUsedHoldTokens = new Map();    // holdToken -> username (historical, used for rotation checks)
+
+function reserveProxyForSession(username, proxy) {
+  if (!proxy?.server) return false;
+  const key = getProxyCacheKey(proxy);
+  if (activeProxyReservations.has(key)) return activeProxyReservations.get(key) === username;
+  activeProxyReservations.set(key, username);
+  return true;
+}
+function releaseProxyReservation(username) {
+  for (const [key, owner] of activeProxyReservations.entries()) {
+    if (owner === username) activeProxyReservations.delete(key);
+  }
+}
+function getReservedProxyKeys() {
+  return new Set(activeProxyReservations.keys());
+}
+function getLaunchingProxyKeys() { return new Set(launchingProxyKeys); }
+function reserveLaunchingProxy(proxy) { if (proxy?.server) launchingProxyKeys.add(getProxyCacheKey(proxy)); }
+function releaseLaunchingProxy(proxy) { if (proxy?.server) launchingProxyKeys.delete(getProxyCacheKey(proxy)); }
+
+function registerHoldToken(username, token) {
+  if (!token || token.length < 8) return;
+  activeHoldTokenRegistry.set(token, username);
+  globalUsedHoldTokens.set(token, username);
+}
+function unregisterHoldToken(token) {
+  if (!token) return;
+  activeHoldTokenRegistry.delete(token);
+}
+function isHoldTokenUsedByAnother(token, username) {
+  const owner = activeHoldTokenRegistry.get(token);
+  return owner && owner !== username;
+}
+
+// Section-level mutex to prevent intra-account races
+const sectionHoldLocks = new Map(); // section -> Promise
+async function acquireSectionHoldLock(section) {
+  const sec = String(section).toUpperCase();
+  while (sectionHoldLocks.has(sec)) { await sectionHoldLocks.get(sec); }
+  let resolve;
+  const p = new Promise(r => resolve = r);
+  sectionHoldLocks.set(sec, p);
+  return () => { sectionHoldLocks.delete(sec); resolve(); };
+}
+const pausedSnipersForTransfer = new Map(); // username -> { sections, wasActive }
 
 // Global seat coordination for multi-account runs (prevents multiple accounts
 // trying to hold the same seats in the same target section)
 let globalSeatPool = new Map(); // seatName -> { username, heldAt, runId }
 let currentRunId = 0;
-
-function safeJsonStringify(obj) {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    try {
-      const seen = new WeakSet();
-      return JSON.stringify(obj, (key, value) => {
-        if (typeof value === 'object' && value !== null) {
-          if (seen.has(value)) return '[Circular]';
-          seen.add(value);
-        }
-        return value;
-      });
-    } catch {
-      return '[unserializable]';
-    }
-  }
-}
+let transferContentionWhitelist = new Set(); // usernames exempt from section contention during active transfers
 
 function emitStatus(stage, message, data = {}) {
   try {
@@ -1009,11 +1837,20 @@ function emitStatus(stage, message, data = {}) {
   } catch (e) {
     fileLog('WARN', `emitStatus socket error: ${e.message}`);
   }
+  // Also emit the stage name as its own event so clients can listen for
+  // specific lifecycle events (transfer-plan-built, destination-ready, etc.).
+  if (stage && typeof stage === 'string') {
+    try {
+      io.emit(stage, { stage, message, ...data });
+    } catch (e) {
+      fileLog('WARN', `emitStatus stage event error: ${e.message}`);
+    }
+  }
   const account = data.account || '';
   const line = `[${stage}]${account ? ` [${account}]` : ''} ${message}`;
   try { console.log(line, data); } catch {}
   try {
-    fileLog('INFO', line + ' ' + safeJsonStringify(data));
+    fileLog('INFO', line + ' ' + safeRedactedStringify(data));
   } catch (e) {
     try { console.error('Logging error:', e.message); } catch {}
   }
@@ -1033,6 +1870,14 @@ function emitAccountUpdate(username, stage, extra = {}) {
   io.emit('account-update', { account: username, stage, ...extra });
 }
 
+function emitSeatEvent(event, username, seats, extra = {}) {
+  if (!Array.isArray(seats) || seats.length === 0) return;
+  const unique = [...new Set(seats.map(String))];
+  io.emit(event, { account: username, seats: unique, ...extra });
+  // Mirror to a generic status event so older clients still see something.
+  emitStatus(event, `${event === 'seat-held' ? 'Held' : 'Released'} ${unique.length} seat(s)`, { account: username, seats: unique, ...extra });
+}
+
 function emitQueueStats() {
   io.emit('queue-stats', {
     active: activeSessions.size,
@@ -1047,6 +1892,25 @@ function emitQueueStats() {
 function resetSeatPool(runId) {
   globalSeatPool.clear();
   currentRunId = runId;
+}
+
+function whitelistForTransfer(usernames) {
+  if (!Array.isArray(usernames)) return;
+  for (const u of usernames) {
+    if (u) transferContentionWhitelist.add(String(u));
+  }
+}
+
+function removeFromTransferWhitelist(username) {
+  if (username) transferContentionWhitelist.delete(String(username));
+}
+
+function clearTransferWhitelist() {
+  transferContentionWhitelist.clear();
+}
+
+function isUsernameWhitelistedForTransfer(username) {
+  return username ? transferContentionWhitelist.has(String(username)) : false;
 }
 
 const SEAT_POOL_TTL_MS = 10 * 60 * 1000; // reservations expire after 10 minutes
@@ -1106,9 +1970,12 @@ function sectionFromSeat(seat) {
 
 function isSectionContested(section, exceptUsername = null) {
   // True if another active account already holds seats in this section.
+  // Accounts participating in an active transfer are exempt so destinations can
+  // receive seats from their source masters without being blocked.
   const sec = String(section).toUpperCase();
   for (const [seat, info] of globalSeatPool.entries()) {
     if (exceptUsername && info.username === exceptUsername) continue;
+    if (isUsernameWhitelistedForTransfer(info.username)) continue;
     if (seat.startsWith(`${sec}-`)) return true;
   }
   return false;
@@ -1117,9 +1984,12 @@ function isSectionContested(section, exceptUsername = null) {
 function isSectionBeingSelected(section, exceptUsername = null) {
   // True if another account is currently in the middle of a select/hold operation
   // targeting this section. This catches the gap between bestAvailable calls.
+  // Whitelisted transfer participants and accounts in an active transfer are skipped.
   const sec = String(section).toUpperCase();
   for (const [username, session] of activeSessions.entries()) {
     if (exceptUsername && username === exceptUsername) continue;
+    if (isUsernameWhitelistedForTransfer(username)) continue;
+    if (session.isTransferring) continue;
     if (!session.isSelecting) continue;
     const targets = session.targetSections || [];
     const quota = session.sectionQuota || [];
@@ -1188,32 +2058,77 @@ function setWsRouteToken(page, token) {
   }
 }
 
+async function createFreshHoldToken(session, expiresInMinutes = 30) {
+  const endpoints = [
+    'https://api.seatcloud.com/api/v2/hold-tokens',
+    'https://api.seatcloud.com/hold-tokens',
+    'https://api-eu.seatsio.net/hold-tokens',
+    'https://api-na.seatsio.net/hold-tokens',
+  ];
+  for (const url of endpoints) {
+    try {
+      const res = await sessionFetch(url, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Origin': WB_ORIGIN, 'Referer': `${WB_ORIGIN}/` },
+        body: JSON.stringify({ expiresInMinutes }),
+      }, session);
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data.holdToken) return data;
+      }
+    } catch (e) { fileLog('INFO', `[${session?.username}] createFreshHoldToken attempt error ${url}: ${e.message}`); }
+  }
+  return null;
+}
+
 async function rotateSessionHoldToken(session) {
   if (!session || !session.page || await isPageClosed(session.page)) return false;
   const oldToken = session.holdToken;
   fileLog('INFO', `[${session.username}] Rotating hold token to avoid collision`);
-  // First try the chart/page token (user-specific).
-  let ext = await extendHoldToken(session);
-  if (!ext.success || ext.newToken === oldToken) {
-    // Fall back to a fresh token via the user's own request context.
-    const pageSlug = parseSlug(session.page.url());
-    if (pageSlug) {
-      try {
-        const detail = await fetchEventDetail(pageSlug);
-        const eventId = detail?._id || detail?.data?._id || null;
-        if (eventId) {
-          const newToken = await getHoldTokenFromApi(pageSlug, eventId, session);
-          if (newToken && newToken !== oldToken) {
-            session.holdToken = newToken;
-            await syncQueueTokenToCookie(session.context, null, newToken);
-            fileLog('INFO', `[${session.username}] Hold token rotated via API: ${oldToken?.slice(0, 12)}... -> ${newToken.slice(0, 12)}...`);
-          }
-        }
-      } catch {}
+
+  // 1. Purge stale token from all storage layers.
+  try {
+    await session.context.clearCookies();
+    await session.page.evaluate(() => {
+      ['holdToken','seatHoldToken','sc_hold_token'].forEach(k => {
+        try { sessionStorage.removeItem(k); } catch {}
+        try { localStorage.removeItem(k); } catch {}
+      });
+    });
+    resetWebSocketRouteState(session.page);
+  } catch (e) {
+    fileLog('WARN', `[${session.username}] Could not purge old hold token: ${e.message}`);
+  }
+
+  // 2. Try a fresh API token first.
+  let newToken = null;
+  const pageSlug = parseSlug(session.page.url());
+  if (pageSlug) {
+    try {
+      const detail = await fetchEventDetail(pageSlug);
+      const eventId = detail?._id || detail?.data?._id || null;
+      if (eventId) {
+        newToken = await getHoldTokenFromApi(pageSlug, eventId, session);
+      }
+    } catch (e) {
+      fileLog('WARN', `[${session.username}] Fresh token fetch failed: ${e.message}`);
     }
   }
-  if (session.holdToken && session.holdToken !== oldToken) {
-    setWsRouteToken(session.page, session.holdToken);
+
+  // 3. Fallback to extension if fresh fetch did not yield a new token.
+  if (!newToken || newToken === oldToken) {
+    const ext = await extendHoldToken(session);
+    if (ext.success && ext.newToken && ext.newToken !== oldToken) newToken = ext.newToken;
+  }
+
+  if (newToken && newToken !== oldToken) {
+    if (oldToken) unregisterHoldToken(oldToken);
+    session.holdToken = newToken;
+    touchHoldToken(session, newToken, HOLD_TOKEN_EXTENSION_MINUTES);
+    registerHoldToken(session.username, newToken);
+    await syncQueueTokenToCookie(session.context, null, newToken);
+    setWsRouteToken(session.page, newToken);
+    fileLog('INFO', `[${session.username}] Hold token rotated: ${oldToken?.slice(0, 12)}... -> ${newToken.slice(0, 12)}...`);
     return true;
   }
   return false;
@@ -1221,12 +2136,19 @@ async function rotateSessionHoldToken(session) {
 
 async function ensureUniqueHoldToken(session) {
   if (!session || !session.holdToken) return;
-  const other = findOtherSessionWithToken(session.holdToken, session.username);
+  let other = findOtherSessionWithToken(session.holdToken, session.username);
+  if (!other) other = isHoldTokenUsedByAnother(session.holdToken, session.username) ? activeHoldTokenRegistry.get(session.holdToken) : null;
   if (!other) return;
   emitStatus('warning', `تنبيه: ${session.username} يشارك نفس hold token مع ${other}، جاري الاستبدال...`, { account: session.username, other, type: 'hold-token-rotation' });
-  const ok = await rotateSessionHoldToken(session);
-  if (!ok) {
+  for (let i = 0; i < 3 && other; i++) {
+    const ok = await rotateSessionHoldToken(session);
+    if (!ok) break;
+    other = findOtherSessionWithToken(session.holdToken, session.username);
+    if (!other) other = isHoldTokenUsedByAnother(session.holdToken, session.username) ? activeHoldTokenRegistry.get(session.holdToken) : null;
+  }
+  if (other) {
     emitStatus('warning', `لم يتمكن من استبدال توكن ${session.username} تلقائيًا`, { account: session.username, type: 'hold-token-rotation-failed' });
+    throw new Error(`HOLD_TOKEN_COLLISION_UNRESOLVED for ${session.username} with ${other}`);
   }
 }
 
@@ -1331,6 +2253,13 @@ function waitFor(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function withTimeout(promise, ms, label = 'operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 // Frontend-style trace_id: timestamp + 11-char random suffix (e.g. 1780599362816-mw4n2zqa1vb).
 function makeTraceId(prefix = '') {
   const rand = Math.random().toString(36).slice(2, 13).padEnd(11, '0');
@@ -1416,7 +2345,7 @@ async function fastAcceptCookies(page, username) {
     const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const locator = page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]')
       .filter({ hasText: new RegExp('^' + escaped + '$', 'i') }).first();
-    return locator.waitFor({ state: 'visible', timeout: 250 }).then(() => locator);
+    return locator.waitFor({ state: 'visible', timeout: 120 }).then(() => locator);
   });
 
   try {
@@ -1469,8 +2398,8 @@ async function dismissAccountDetailsModal(page, username) {
   // 1) Try Playwright locator for the close button inside any dialog.
   try {
     const closeBtn = page.locator('[role="dialog"] button[aria-label="Close"], div.fixed button[aria-label="Close"]').first();
-    await closeBtn.waitFor({ state: 'visible', timeout: 800 });
-    await closeBtn.click({ timeout: 2000 });
+    await closeBtn.waitFor({ state: 'visible', timeout: 300 });
+    await closeBtn.click({ timeout: 1500 });
     emitStatus('modal-dismissed', 'Account-details modal dismissed (close-x)', { account: username });
     return true;
   } catch {}
@@ -1526,7 +2455,7 @@ async function dismissSeatSelectionTutorial(page, username) {
     const tutorial = page.locator('[role="dialog"], div[aria-modal="true"], div.fixed, div[class*="modal" i]')
       .filter({ hasText: /كيفية اختيار مقعد/i });
     const closeBtn = tutorial.locator('button[aria-label="إغلاق"], button:has-text("حسناً")').first();
-    await closeBtn.click({ timeout: 500 });
+    await closeBtn.click({ timeout: 300 });
     emitStatus('modal-dismissed', 'Seat selection tutorial dismissed', { account: username });
     return true;
   } catch {}
@@ -1571,29 +2500,33 @@ async function dismissSeatSelectionTutorial(page, username) {
 
 async function dismissAllBanners(page, username, reason = 'generic') {
   // Dismiss cookie, account-details, and seat-selection tutorial banners as fast as possible.
-  let results = await Promise.allSettled([
-    fastAcceptCookies(page, username),
-    dismissAccountDetailsModal(page, username),
-    dismissSeatSelectionTutorial(page, username),
-  ]);
-  let cookieClosed = results[0].status === 'fulfilled' && results[0].value;
-  let modalClosed = results[1].status === 'fulfilled' && results[1].value;
-  let tutorialClosed = results[2].status === 'fulfilled' && results[2].value;
-
-  if (!cookieClosed || !modalClosed || !tutorialClosed) {
-    await waitFor(100);
-    results = await Promise.allSettled([
+  // All three attempts run in parallel with a tight overall timeout so navigation
+  // is never delayed waiting for banners that may not exist.
+  const run = async () => {
+    const results = await Promise.allSettled([
       fastAcceptCookies(page, username),
       dismissAccountDetailsModal(page, username),
       dismissSeatSelectionTutorial(page, username),
     ]);
-    if (!cookieClosed) cookieClosed = results[0].status === 'fulfilled' && results[0].value;
-    if (!modalClosed) modalClosed = results[1].status === 'fulfilled' && results[1].value;
-    if (!tutorialClosed) tutorialClosed = results[2].status === 'fulfilled' && results[2].value;
+    return {
+      cookieClosed: results[0].status === 'fulfilled' && results[0].value,
+      modalClosed: results[1].status === 'fulfilled' && results[1].value,
+      tutorialClosed: results[2].status === 'fulfilled' && results[2].value,
+    };
+  };
+
+  let state = { cookieClosed: false, modalClosed: false, tutorialClosed: false };
+  try {
+    state = await Promise.race([
+      run(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 500)),
+    ]);
+  } catch {
+    state = await run();
   }
 
-  fileLog('INFO', `[${username}] dismissAllBanners(${reason}): cookie=${cookieClosed}, modal=${modalClosed}, tutorial=${tutorialClosed}`);
-  return { cookieClosed, modalClosed, tutorialClosed };
+  fileLog('INFO', `[${username}] dismissAllBanners(${reason}): cookie=${state.cookieClosed}, modal=${state.modalClosed}, tutorial=${state.tutorialClosed}`);
+  return state;
 }
 
 async function waitForAnySelector(page, selectors, timeoutMs = 10000, visible = true) {
@@ -1629,6 +2562,10 @@ async function ensureBrowser() {
       '--disable-background-networking',
       '--disable-background-timer-throttling',
       '--disable-renderer-backgrounding',
+      '--force-webrtc-ip-handling-policy=default_public_interface_only',
+      '--disable-webrtc',
+      '--disable-webrtc-hw-encoding',
+      '--disable-webrtc-hw-decoding',
     ],
   });
   return globalBrowser;
@@ -1638,7 +2575,12 @@ async function createMobileContext(username = null, attempt = 1, proxy = null) {
   // Every concurrent user MUST get a brand-new Playwright browser context with a
   // unique randomized device profile, viewport, user agent, and stealth parameters.
   // This guarantees total storage, cookie, and memory isolation between accounts.
-  await pruneOldContexts(true);
+  fileLog('INFO', `[${username}] createMobileContext start (attempt ${attempt})`);
+  try {
+    await withTimeout(pruneOldContexts(true), 5_000, `prune old contexts for ${username}`);
+  } catch (pruneErr) {
+    fileLog('WARN', `[${username}] pruneOldContexts timed out or failed: ${pruneErr.message}`);
+  }
   let browser = await ensureBrowser();
   if (!browser.isConnected()) {
     fileLog('WARN', `[${username}] Browser not connected before newContext; relaunching`);
@@ -1714,10 +2656,9 @@ async function createMobileContext(username = null, attempt = 1, proxy = null) {
       if (e.message.includes('closed') || !browser.isConnected()) {
         globalBrowser = null;
       }
-      // If proxy context creation fails and we are not in required mode, retry direct once.
-      if (proxyOption && currentProxyMode !== 'required') {
-        fileLog('WARN', `[${username}] Retrying context creation without proxy after failure`);
-        return createMobileContext(username, attempt + 1, null);
+      // Proxy isolation is mandatory once a proxy is chosen; never silently drop it.
+      if (proxyOption) {
+        throw new Error(`PROXY_CONTEXT_FAILED: ${e.message} (proxy=${proxyOption.server})`);
       }
       await waitFor(150);
       return createMobileContext(username, attempt + 1, proxy);
@@ -1853,7 +2794,7 @@ function parseSlug(url) {
 
 async function fetchEventDetail(slug) {
   const url = `${WB_API_BASE}/event-detail/${slug}?lang=ar&visible_in=rs`;
-  const res = await fetch(url, {
+  const res = await sessionFetch(url, {
     headers: {
       'Accept': 'application/json',
       'Origin': WB_ORIGIN,
@@ -2465,6 +3406,7 @@ async function swapToProvidedHoldToken(page, session, bookingUrl) {
   }
 
   session.holdToken = token;
+  touchHoldToken(session, token, HOLD_TOKEN_EXTENSION_MINUTES);
   fileLog('INFO', `[${username}] Hold token swap complete; page token=${(await readChartHoldToken(page) || '').slice(0, 12)}...`);
   return true;
 }
@@ -2511,8 +3453,8 @@ async function waitForQueueClear(page, username, session, slug, timeoutMs = 20 *
       if (!status.queued && status.holdToken) {
         stopPageTimerWatcher(session);
         if (queueToken) {
-          globalValidQueueToken = queueToken;
-          fileLog('INFO', `[${username}] Harvested global queue token for followers`);
+          setGlobalValidQueueToken(queueToken);
+          broadcastQueueTokenToPending(queueToken);
         }
         emitStatus('queue-cleared', 'Queue cleared via API; proceeding directly to WebSocket attack.', { account: username, holdToken: true });
         return { cleared: true, queueToken, holdToken: status.holdToken };
@@ -2522,11 +3464,27 @@ async function waitForQueueClear(page, username, session, slug, timeoutMs = 20 *
       if (!status.queued) {
         stopPageTimerWatcher(session);
         if (queueToken) {
-          globalValidQueueToken = queueToken;
-          fileLog('INFO', `[${username}] Harvested global queue token for followers (no hold token yet)`);
+          setGlobalValidQueueToken(queueToken);
+          broadcastQueueTokenToPending(queueToken);
         }
         emitStatus('queue-cleared', 'Queue cleared via API (no hold token yet).', { account: username });
         return { cleared: true, queueToken, holdToken: status.holdToken || null };
+      }
+
+      // Aggressive bypass: even when the queue API says queued, directly ask the
+      // hold-token endpoint for a token. If it returns one, the queue has actually
+      // cleared and we should attack immediately.
+      if (status.queued && !status.holdToken && Date.now() - start < 120000) {
+        try {
+          const directToken = await getHoldTokenFromApi(slug, '', session);
+          if (directToken) {
+            stopPageTimerWatcher(session);
+            emitStatus('queue-cleared', 'Queue bypassed via direct hold-token fetch.', { account: username, holdToken: true });
+            return { cleared: true, queueToken, holdToken: directToken };
+          }
+        } catch (e) {
+          fileLog('WARN', `[${username}] Direct hold-token bypass attempt failed: ${e.message}`);
+        }
       }
 
       let q = status.queue;
@@ -2569,7 +3527,7 @@ async function waitForQueueClear(page, username, session, slug, timeoutMs = 20 *
     }
 
     // Poll aggressively for real-time queue changes (sub-second).
-    await waitFor(200);
+    await waitFor(100);
   }
 
   throw new Error('Queue did not clear within timeout');
@@ -2588,7 +3546,15 @@ function startPageTimerWatcher(session) {
         return;
       }
       const info = await extractQueueTimer(session.page);
-      if (!info.found) return;
+      if (!info.found) {
+        // Clear the stored timer when no timer is visible so keepalive does not
+        // make extension decisions based on a stale value.
+        if (session.lastPageTimerSeconds !== null) {
+          session.lastPageTimerSeconds = null;
+          session.lastPageTimerText = null;
+        }
+        return;
+      }
       const seconds = parseQueueTimerText(info.text);
       if (seconds === null) return;
       if (seconds !== lastSeconds || info.text !== lastText) {
@@ -3014,6 +3980,80 @@ async function detectBookingPageState(page) {
   }
 }
 
+async function detectQueueStateAccurate(page, username = '') {
+  try {
+    const result = await page.evaluate(() => {
+      const pathname = (window.location.pathname || '').toLowerCase();
+      const text = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+
+      const onBookPage = pathname.endsWith('/book');
+      const hasCountdown = !!document.querySelector('[data-testid="countdown-timer"]');
+      const hasStadiumCanvas = !!document.querySelector('canvas#canvas[aria-label*="Stadium seats map"]');
+      const hasChartIframe = !!document.querySelector('iframe[src*="seatcloud"], iframe[src*="seats.io"], iframe[src*="chart.seatcloud"]');
+      const chartRoot = document.querySelector('#chart, #seat-chart, [data-testid*="chart" i], [class*="seatsio" i]');
+      const hasChart = hasStadiumCanvas || hasChartIframe || !!chartRoot;
+
+      if (onBookPage && (hasChart || hasCountdown)) {
+        return { isInQueue: false, confidence: 'high', evidence: ['on-book-page-with-chart-or-timer'], hasChart, hasTimer: hasCountdown, queuePosition: null };
+      }
+
+      const queueSelectors = [
+        '[data-testid="queue-timer"]',
+        '[data-testid="queue-position"]',
+        '[data-testid="queue-progress"]',
+        '[data-testid="queue-status"]',
+      ];
+      const queueElements = queueSelectors.map(s => document.querySelector(s)).filter(Boolean);
+      const hasQueueElement = queueElements.length > 0;
+
+      const queueClassPattern = /queue|waiting|waitroom|waitingroom/;
+      const hasQueueClass = Array.from(document.querySelectorAll('*')).some(el => queueClassPattern.test((el.className || '') + ' ' + (el.getAttribute('data-testid') || '')));
+
+      const queueKeywords = ['الطابور', 'طابور', 'queue', 'waiting room', 'waitingroom', 'انتظر دورك', 'دورك', 'you are in line', 'in line'];
+      const isBookingHoldTimerText = text.includes('للحجز');
+      const hasQueueText = !isBookingHoldTimerText && queueKeywords.some(k => text.includes(k));
+
+      const urlQueueSignal = /queue|waiting|waitroom/.test(pathname + window.location.search);
+
+      let queuePosition = null;
+      for (const el of queueElements) {
+        const elText = (el.innerText || el.textContent || '').trim();
+        const m = elText.match(/(\d+)/);
+        if (m) { queuePosition = parseInt(m[1], 10); break; }
+      }
+      if (queuePosition === null && hasQueueText) {
+        const m = text.match(/(?:position|موقعك|دورك|r?\#?)\s*(\d+)/i);
+        if (m) queuePosition = parseInt(m[1], 10);
+      }
+
+      const isQueue = hasQueueElement || (hasQueueText && hasQueueClass) || (hasQueueText && urlQueueSignal) || (hasQueueText && !onBookPage && !hasChart && !hasCountdown);
+      const isInQueue = isQueue;
+
+      const evidence = [];
+      if (hasQueueElement) evidence.push('queue-element-detected');
+      if (hasQueueClass) evidence.push('queue-class-detected');
+      if (hasQueueText) evidence.push('queue-text-detected');
+      if (urlQueueSignal) evidence.push('url-queue-signal');
+      if (hasChart) evidence.push('chart-present');
+      if (hasCountdown) evidence.push('booking-timer-present');
+
+      return {
+        isInQueue,
+        confidence: hasQueueElement ? 'high' : (isQueue ? 'medium' : 'low'),
+        evidence,
+        hasChart,
+        hasTimer: hasCountdown,
+        queuePosition,
+      };
+    });
+    fileLog('INFO', `[queue-detect] ${username}: isInQueue=${result.isInQueue}, confidence=${result.confidence}, evidence=${result.evidence.join('|')}`);
+    return result;
+  } catch (err) {
+    fileLog('WARN', `[queue-detect] ${username}: detection error: ${err.message}`);
+    return { isInQueue: false, confidence: 'error', evidence: ['eval-error'], hasChart: false, hasTimer: false, queuePosition: null };
+  }
+}
+
 function parseQueueTimerText(text) {
   // Matches timers like "07:59 للحجز", "7:59", "07:59:12" -> returns total seconds.
   if (!text) return null;
@@ -3029,12 +4069,27 @@ function parseQueueTimerText(text) {
 async function extractQueueTimer(page) {
   try {
     return await page.evaluate(() => {
-      // Primary: green/success timer used on queue and booking pages.
+      // Primary: the official booking-page countdown container.
+      const countdownTimer = document.querySelector('[data-testid="countdown-timer"]');
+      if (countdownTimer) {
+        const text = (countdownTimer.innerText || countdownTimer.textContent || '').trim();
+        if (/\d{1,2}:\d{2}/.test(text)) return { text, found: true };
+      }
+      // Secondary: green/success timer used on some queue and booking builds.
       const successSpan = document.querySelector('span.text-success, .text-success');
       if (successSpan) {
         const container = successSpan.closest('p, div, span') || successSpan;
         const text = (container.innerText || container.textContent || '').trim();
         if (/\d{1,2}:\d{2}/.test(text)) return { text, found: true };
+      }
+      // Tertiary: any visible timer-like element.
+      const timerSelectors = ['.timer', '#timer', '[class*="timer" i]', '[class*="countdown" i]'];
+      for (const sel of timerSelectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const text = (el.innerText || el.textContent || '').trim();
+          if (/\d{1,2}:\d{2}/.test(text)) return { text, found: true };
+        }
       }
       // Fallback: any visible element containing a time-like string near booking/payment text.
       const all = Array.from(document.querySelectorAll('span, p, div, h1, h2, h3, h4, h5, h6'));
@@ -3124,12 +4179,12 @@ async function waitForSeatChartInteractive(page, timeout = 30000) {
   }
 }
 
-async function waitForBookingTrigger(page, timeoutMs = 30000, deadlineSeconds = 600) {
+async function waitForBookingTrigger(page, timeoutMs = 8000, deadlineSeconds = 600) {
   // Ultra-fast booking-open detector. Uses a DOM MutationObserver for instant
-  // notification plus a 20ms polling fallback, so the sniper fires the exact
+  // notification plus a 10ms polling fallback, so the sniper fires the exact
   // millisecond the chart/canvas/timer appears.
   const start = Date.now();
-  const pollInterval = 20;
+  const pollInterval = 10;
   let lastReason = 'timeout';
   let resolved = false;
   let resolveObserver = null;
@@ -3375,6 +4430,12 @@ app.get('/api/check-queue', async (req, res) => {
 });
 
 async function fetchChartSections(slug) {
+  const now = Date.now();
+  const cached = CHART_SECTIONS_CACHE.get(slug);
+  if (cached && now - cached.ts < CHART_SECTIONS_CACHE_TTL_MS) {
+    return cached.result;
+  }
+
   const json = await fetchEventDetail(slug);
   const data = json.data || json;
   const seatsIo = data.seats_io || {};
@@ -3439,7 +4500,18 @@ async function fetchChartSections(slug) {
     representedCategories.add(t.categoryKey);
   }
 
-  return { event: data.title, chartSections, workspaceKey, eventKey, teams, allTeamIds, allChannelKeys, commonChannelKeys };
+  // Extract per-user ticket limit from event detail if available.
+  const maxTicketsPerUser = parseInt(
+    data.maxTicketsPerUser || data.max_tickets_per_user || data.max_per_order ||
+    data.event?.maxTicketsPerUser || data.event?.max_tickets_per_user ||
+    data.maxTickets || data.ticket_limit || data.maxTicketCount || 30,
+    10
+  ) || 30;
+
+  const result = { event: data.title, chartSections, workspaceKey, eventKey, teams, allTeamIds, allChannelKeys, commonChannelKeys, maxTicketsPerUser };
+  CHART_SECTIONS_CACHE.set(slug, { ts: Date.now(), result });
+  trimCache(CHART_SECTIONS_CACHE, 200);
+  return result;
 }
 
 function distributeSectionQuotas(selectedSections, accounts, chartSections) {
@@ -3582,7 +4654,21 @@ async function fetchChartSectionsFromPage(eventUrl) {
         return { label, availableCount: sec.availableCount, categories };
       });
 
-    return { event: eventUrl, chartSections, source: keys.source, teams, allTeamIds, allChannelKeys, commonChannelKeys };
+    // Try to extract per-user ticket limit from the page/API detail.
+    let maxTicketsPerUser = 30;
+    try {
+      const slug = parseSlug(eventUrl);
+      const detail = await fetchEventDetail(slug);
+      const detailData = detail.data || detail;
+      maxTicketsPerUser = parseInt(
+        detailData.maxTicketsPerUser || detailData.max_tickets_per_user || detailData.max_per_order ||
+        detailData.event?.maxTicketsPerUser || detailData.event?.max_tickets_per_user ||
+        detailData.maxTickets || detailData.ticket_limit || detailData.maxTicketCount || 30,
+        10
+      ) || 30;
+    } catch {}
+
+    return { event: eventUrl, chartSections, source: keys.source, teams, allTeamIds, allChannelKeys, commonChannelKeys, maxTicketsPerUser };
   } finally {
     try { if (page) await page.close(); } catch {}
     try { if (ctx) await ctx.close(); } catch {}
@@ -3683,14 +4769,18 @@ app.post('/api/start-booking', async (req, res) => {
 
     maxConcurrency = estimateMaxConcurrency(parseInt(userMax, 10) || 0);
 
-    // Warn if multiple accounts were given the same hold token; this causes
+    // Reject if multiple accounts share the same hold token; this causes
     // SeatCloud to treat them as one session and drop each other's holds.
-    detectSharedHoldTokens(accounts, 'start-booking');
+    const sharedTokens = detectSharedHoldTokens(normalizedAccounts, 'start-booking');
+    if (sharedTokens.length > 0) {
+      const msg = `Shared hold tokens detected: ${sharedTokens.map(c => c.token).join(', ')}`;
+      fileLog('ERROR', `[start-booking] ${msg}`);
+      return res.status(400).json({ success: false, error: msg, collisions: sharedTokens });
+    }
 
-    // Pre-assign unique tested proxies to accounts that opted-in for proxy mode.
-    const accountsWithProxy = (currentProxyMode !== 'off')
-      ? await assignProxiesToAccounts(accounts)
-      : accounts.map(a => ({ ...a, assignedProxy: null }));
+    // Global proxy assignment: all accounts share the single global Proxies list.
+    // Accounts with useProxy=true get a tested proxy pre-assigned before launch.
+    const accountsWithProxy = await assignProxiesToAccounts(normalizedAccounts);
 
     pendingQueue = accountsWithProxy.map((a, idx) => ({
       username: a.username,
@@ -3786,13 +4876,23 @@ app.post('/api/proceed-payment', async (req, res) => {
   const { username } = req.body;
   const session = activeSessions.get(username);
   if (!session) return res.status(400).json({ error: 'No active session for this account' });
-  if (session.proceedResolve) session.proceedResolve();
+  if (session.bookingPaused || session.stopRequested) {
+    return res.status(409).json({ success: false, error: 'Session is paused or stopped; cannot proceed to payment' });
+  }
+  if (session.proceedResolve) session.proceedResolve('proceed');
   res.json({ success: true, message: 'Proceed signal sent' });
 });
 
 app.post('/api/stop-booking', async (req, res) => {
-  await stopAll('user-stop-all');
-  res.json({ success: true, message: 'All sessions stopped' });
+  // Soft stop: keep browsers open and continue extending held seats so the
+  // operator can proceed to payment, but stop snipers/watchers/refills.
+  await stopAll('user-stop-all', true);
+  res.json({ success: true, message: 'All sessions paused; held seats kept' });
+});
+
+app.post('/api/stop-booking-hard', async (req, res) => {
+  await stopAll('user-stop-all-hard', false);
+  res.json({ success: true, message: 'All sessions stopped and browsers closed' });
 });
 
 app.post('/api/stop-account', async (req, res) => {
@@ -3800,13 +4900,16 @@ app.post('/api/stop-account', async (req, res) => {
   if (!username) return res.status(400).json({ success: false, error: 'username or email required' });
   const session = activeSessions.get(username);
   if (!session) return res.status(400).json({ success: false, error: 'No active session for this account' });
-  // Pause booking attempts (sniper + direct WS) while keeping the browser open
-  // and any currently held seats intact.
+  // Soft pause: stop the active sniper for this user without closing the
+  // browser or releasing currently held seats, so the operator can still
+  // proceed to payment. The sniper scheduleNext loop must also check
+  // bookingPaused to avoid rescheduling itself.
   session.bookingPaused = true;
   stopActiveSniper(session);
-  emitStatus('booking-paused', 'Booking attempts paused; browser and held seats remain active', { account: username, heldSeats: session.selectedSeats || [] });
+  clearHoldWatcher(session);
+  emitStatus('booking-paused', 'Sniper/watcher stopped for this account; browser and held seats remain active', { account: username, heldSeats: session.selectedSeats || [] });
   emitAccountUpdate(username, 'paused', { seats: session.selectedSeats || [] });
-  res.json({ success: true, message: 'Booking paused; held seats kept' });
+  res.json({ success: true, message: 'Sniper paused; held seats kept' });
 });
 
 app.post('/api/release-hold', async (req, res) => {
@@ -4134,8 +5237,13 @@ app.post('/api/start-pair-cycling', async (req, res) => {
     await stopAll('pair-cycling-started');
     await waitFor(400);
 
-    // Warn if multiple pair accounts share the same hold token.
-    detectSharedHoldTokens(accounts, 'pair-cycling');
+    // Reject if multiple pair accounts share the same hold token.
+    const sharedTokens = detectSharedHoldTokens(accounts, 'pair-cycling');
+    if (sharedTokens.length > 0) {
+      const msg = `Shared hold tokens detected: ${sharedTokens.map(c => c.token).join(', ')}`;
+      fileLog('ERROR', `[pair-cycling] ${msg}`);
+      return res.status(400).json({ success: false, error: msg, collisions: sharedTokens });
+    }
 
     // Pre-fetch workspace/event keys so each pair wave does not have to re-fetch them.
     let globalWorkspaceKey = null;
@@ -4271,12 +5379,1093 @@ app.post('/api/extend-token', async (req, res) => {
   }
 });
 
-async function transferSeatsBetweenAccounts(fromUsername, toUsername) {
+// Extend hold tokens for all active sessions in one call.
+app.post('/api/extend-all', async (req, res) => {
+  const results = [];
+  for (const [username, session] of activeSessions) {
+    if (!session.page || await isPageClosed(session.page)) {
+      results.push({ username, success: false, error: 'No active session page' });
+      continue;
+    }
+    try {
+      const result = await extendHoldToken(session);
+      results.push({ username, ...result });
+    } catch (err) {
+      results.push({ username, success: false, error: err.message });
+    }
+  }
+  res.json({ success: true, count: results.filter(r => r.success).length, total: results.length, results });
+});
+
+// Get live session info including hold token timestamps.
+app.get('/api/session-info/:username', async (req, res) => {
+  const session = activeSessions.get(req.params.username);
+  if (!session) return res.status(404).json({ success: false, error: 'No active session' });
+  res.json({
+    success: true,
+    username: session.username,
+    holdToken: session.holdToken ? `${session.holdToken.slice(0, 12)}...${session.holdToken.slice(-4)}` : null,
+    holdTokenCreatedAt: session.holdTokenCreatedAt,
+    holdTokenExpiresAt: session.holdTokenExpiresAt,
+    selectedSeats: session.selectedSeats || [],
+    state: session.state,
+    stage: session.bookingPaused ? 'paused' : session.state,
+  });
+});
+
+// Refresh the Webook JWT access token for an active session using the refresh_token cookie.
+app.post('/api/refresh-auth-token', async (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ success: false, error: 'username required' });
+  const session = activeSessions.get(username);
+  if (!session || !session.page) return res.status(400).json({ success: false, error: 'No active session for this account' });
+  try {
+    const result = await tryRefreshToken(session.page, username, session);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ------------------------------------------------------------------
+// Advanced seat-transfer planning helpers
+// ------------------------------------------------------------------
+
+function assignSeatsToDestinations(seatPool, destinations) {
+  // Distribute seats to destinations according to explicit ticketCount,
+  // falling back to a fair split when the requested total does not match.
+  if (!Array.isArray(seatPool) || seatPool.length === 0) return [];
+  if (!Array.isArray(destinations) || destinations.length === 0) return [];
+
+  const total = seatPool.length;
+  const totalRequested = destinations.reduce((sum, d) => sum + (d.ticketCount || 0), 0);
+  const remaining = seatPool.slice();
+  const result = [];
+
+  if (totalRequested > 0 && totalRequested <= total) {
+    // Exact distribution by requested counts.
+    for (const dest of destinations) {
+      const count = Math.min(dest.ticketCount || 0, remaining.length);
+      const assigned = remaining.splice(0, count);
+      result.push({ username: dest.username, assignedSeats: assigned });
+    }
+  } else {
+    // Fair distribution.
+    const base = Math.floor(total / destinations.length);
+    let remainder = total % destinations.length;
+    for (const dest of destinations) {
+      const count = base + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder--;
+      const assigned = remaining.splice(0, count);
+      result.push({ username: dest.username, assignedSeats: assigned });
+    }
+  }
+  return result;
+}
+
+async function buildTransferPlan(masterSessions, destinationSpecs, opts = {}) {
+  // 1. Verify seats from every master and build a single pool.
+  const masters = [];
+  const seatPool = [];
+  const sourceMap = new Map(); // seat -> source username
+  for (const master of masterSessions) {
+    if (!master || !master.page || await isPageClosed(master.page)) {
+      throw new Error(`Master account ${master?.username} has no active session`);
+    }
+    const verified = await verifyHeldSeatsViaApi(master.page, master.holdToken, master.selectedSeats || [], { session: master });
+    if (!verified.length) continue;
+    masters.push({ username: master.username, session: master, verifiedSeats: verified });
+    for (const seat of verified) {
+      seatPool.push(seat);
+      if (!sourceMap.has(seat)) sourceMap.set(seat, master.username);
+    }
+  }
+  if (seatPool.length === 0) throw new Error('No verified seats held by any master account');
+
+  // 2. Build destination specs with ticket counts.
+  const destinationSpecsWithCounts = destinationSpecs.map(d => ({
+    username: d.username,
+    ticketCount: typeof d.ticketCount === 'number' && d.ticketCount > 0 ? d.ticketCount : 0,
+  }));
+
+  // 3. Assign seats.
+  const assignments = assignSeatsToDestinations(seatPool, destinationSpecsWithCounts);
+
+  // 4. Group assigned seats by source master for batch release.
+  const plan = {
+    mode: opts.mode === 'legacy' ? 'legacy' : (opts.mode === 'atomic' ? 'atomic' : 'auto'),
+    batchSize: opts.batchSize ? Math.max(1, Math.min(parseInt(opts.batchSize, 10) || 5, 10)) : 5,
+    maxBatchRetries: Math.max(1, Math.min(parseInt(opts.maxBatchRetries, 10) || 2, 5)),
+    masters,
+    destinations: assignments.map(a => {
+      const bySource = new Map();
+      for (const seat of a.assignedSeats) {
+        const source = sourceMap.get(seat);
+        if (!source) continue;
+        if (!bySource.has(source)) bySource.set(source, []);
+        bySource.get(source).push(seat);
+      }
+      return {
+        username: a.username,
+        assignedSeats: a.assignedSeats,
+        seatsBySource: Object.fromEntries(bySource),
+      };
+    }),
+  };
+  return plan;
+}
+
+async function prepareDestinationForTransfer(destUser, assignedSeats, account, options = {}) {
+  const { url, targetSections } = options;
+  const prepStartMs = Date.now();
+  fileLog('INFO', `[transfer-prep] [${destUser}] Entering prepareDestinationForTransfer, assigned=${(assignedSeats || []).length}`);
+
+  // Reuse active session if it is still alive.
+  let session = activeSessions.get(destUser);
+  if (session && session.page && !(await isPageClosed(session.page))) {
+    fileLog('INFO', `[transfer-prep] [${destUser}] Reusing active session (${Date.now() - prepStartMs}ms)`);
+    session.state = 'seats-monitoring';
+    session.sniperTargetSeats = Array.isArray(assignedSeats) ? assignedSeats.slice() : [];
+    session.targetSeatCount = Math.max(session.targetSeatCount || 0, session.sniperTargetSeats.length);
+    if (!session.fullSession) {
+      try {
+        session.fullSession = await harvestFullSession(session.page, session.context, destUser);
+        fileLog('INFO', `[transfer-prep] Harvested full session while reusing active session for ${destUser}`);
+      } catch (harvestErr) {
+        fileLog('WARN', `[transfer-prep] Could not harvest full session for reused active session ${destUser}: ${harvestErr.message}`);
+      }
+    }
+    emitStatus('destination-ready', `Destination ${destUser} reused active session`, { account: destUser, seats: session.sniperTargetSeats });
+    return session;
+  }
+
+  const launchAccount = account && account.username
+    ? { ...account, url: account.url || url, targetSections: account.targetSections || targetSections }
+    : { username: destUser, useProxy: false, url, targetSections };
+  fileLog('INFO', `[transfer-prep] [${destUser}] launchAccount type=${launchAccount.type || 'credentials'}, useProxy=${launchAccount.useProxy}, hasCookies=${!!(launchAccount.rawCookies || launchAccount.structuredCookies)}`);
+
+  // Fast path 1: use a previously harvested full session cache.
+  fileLog('INFO', `[transfer-prep] [${destUser}] Trying cached session path (${Date.now() - prepStartMs}ms)`);
+  let fullSession = await loadSessionFromCache(destUser);
+  if (fullSession && validateSession(fullSession)) {
+    try {
+      const { context, page, isValid } = await createSessionWithContext(fullSession, { targetUrl: url, proxy: launchAccount.assignedProxy });
+      if (isValid && page) {
+        fileLog('INFO', `[transfer-prep] [${destUser}] Cached session context created (${Date.now() - prepStartMs}ms)`);
+        session = buildSessionFromInjectedContext(destUser, context, page, launchAccount, url, targetSections);
+        installChartDetectionHook(page, session);
+        await navigateToBookingPage(page, url, destUser);
+        await waitForChartAndStartImmediate(page, session, { timeoutMs: 20000 });
+        activeSessions.set(destUser, session);
+        try {
+          session.fullSession = await harvestFullSession(page, context, destUser);
+          fileLog('INFO', `[transfer-prep] Harvested full session from cached-session path for ${destUser}`);
+        } catch (harvestErr) {
+          fileLog('WARN', `[transfer-prep] Could not harvest full session for cached session ${destUser}: ${harvestErr.message}`);
+        }
+        session.state = 'seats-monitoring';
+        session.sniperTargetSeats = Array.isArray(assignedSeats) ? assignedSeats.slice() : [];
+        session.targetSeatCount = Math.max(session.targetSeatCount || 0, session.sniperTargetSeats.length);
+        emitStatus('destination-ready', `Destination ${destUser} prepared from cached session`, { account: destUser, seats: session.sniperTargetSeats });
+        return session;
+      }
+    } catch (cacheErr) {
+      fileLog('WARN', `[transfer-prep] Cached session path failed for ${destUser}: ${cacheErr.message}`);
+    }
+  }
+
+  // Fast path 2: cookie injection for holdToken/cookie accounts.
+  if (launchAccount.rawCookies || launchAccount.structuredCookies || launchAccount.type === 'holdToken') {
+    fileLog('INFO', `[transfer-prep] [${destUser}] Trying cookie injection path (${Date.now() - prepStartMs}ms)`);
+    try {
+      session = await ensureSessionForTransfer(launchAccount, { url, targetSections });
+      if (session && session.page) {
+        fileLog('INFO', `[transfer-prep] [${destUser}] Cookie session created (${Date.now() - prepStartMs}ms)`);
+        installChartDetectionHook(session.page, session);
+        await waitForChartAndStartImmediate(session.page, session, { timeoutMs: 20000 });
+        if (!session.fullSession) {
+          try {
+            session.fullSession = await harvestFullSession(session.page, session.context, destUser);
+            fileLog('INFO', `[transfer-prep] Harvested full session from cookie path for ${destUser}`);
+          } catch (harvestErr) {
+            fileLog('WARN', `[transfer-prep] Could not harvest full session for cookie path ${destUser}: ${harvestErr.message}`);
+          }
+        }
+        session.state = 'seats-monitoring';
+        session.sniperTargetSeats = Array.isArray(assignedSeats) ? assignedSeats.slice() : [];
+        session.targetSeatCount = Math.max(session.targetSeatCount || 0, session.sniperTargetSeats.length);
+        emitStatus('destination-ready', `Destination ${destUser} prepared via cookie injection`, { account: destUser, seats: session.sniperTargetSeats });
+        return session;
+      }
+    } catch (cookieErr) {
+      fileLog('WARN', `[transfer-prep] Cookie injection path failed for ${destUser}: ${cookieErr.message}`);
+    }
+  }
+
+  // Fallback: full login flow.
+  fileLog('INFO', `[transfer-prep] [${destUser}] Falling back to login flow (${Date.now() - prepStartMs}ms)`);
+  session = await ensureSessionForTransfer(launchAccount, { url, targetSections });
+  if (!session || !session.page) throw new Error(`Could not prepare destination session for ${destUser}`);
+  fileLog('INFO', `[transfer-prep] [${destUser}] Login/session created (${Date.now() - prepStartMs}ms)`);
+  installChartDetectionHook(session.page, session);
+  try {
+    await waitForChartAndStartImmediate(session.page, session, { timeoutMs: 25000 });
+  } catch (chartErr) {
+    fileLog('WARN', `[transfer-prep] Chart wait warning for ${destUser}: ${chartErr.message}`);
+  }
+  if (!session.fullSession) {
+    try {
+      session.fullSession = await harvestFullSession(session.page, session.context, destUser);
+      fileLog('INFO', `[transfer-prep] Harvested full session from login path for ${destUser}`);
+    } catch (harvestErr) {
+      fileLog('WARN', `[transfer-prep] Could not harvest full session for login path ${destUser}: ${harvestErr.message}`);
+    }
+  }
+
+  session.state = 'seats-monitoring';
+  session.sniperTargetSeats = Array.isArray(assignedSeats) ? assignedSeats.slice() : [];
+  session.targetSeatCount = Math.max(session.targetSeatCount || 0, session.sniperTargetSeats.length);
+  fileLog('INFO', `[transfer-prep] [${destUser}] Destination ready, starting targeted sniper (${Date.now() - prepStartMs}ms)`);
+  emitStatus('destination-preparing', `Preparing destination ${destUser} with ${session.sniperTargetSeats.length} target seat(s)`, { account: destUser, seats: session.sniperTargetSeats });
+
+  // Start a targeted sniper that watches only the assigned seats.
+  startActiveSniper(session, targetSections || session.sniperSections || []);
+  emitStatus('destination-ready', `Destination ${destUser} is monitoring target seats`, { account: destUser, seats: session.sniperTargetSeats });
+  return session;
+}
+
+function buildSessionFromInjectedContext(username, context, page, account, url, targetSections) {
+  sessionCounter++;
+  return {
+    id: sessionCounter,
+    username,
+    password: account.password || '',
+    type: account.type || 'credentials',
+    url: account.url || url,
+    targetSections: account.targetSections || targetSections,
+    targetSeatCount: Math.max(1, Math.min(parseInt(account.ticketCount, 10) || 30, MAX_HELD_SEATS)),
+    isSelecting: false,
+    isTransferring: false,
+    context,
+    page,
+    state: 'seats-monitoring',
+    selectedSeats: [],
+    releasedSeats: new Set(),
+    holdToken: null,
+    holdTokenCreatedAt: null,
+    holdTokenExpiresAt: null,
+    holdInterval: null,
+    stopRequested: false,
+    bookingPaused: false,
+    __skipLogin: true,
+    speedSettings: { ...currentSpeedSettings },
+    proxy: account.assignedProxy || null,
+    proxyMode: account.useProxy ? 'required' : 'off',
+    workspaceKey: null,
+    eventKey: null,
+    chartSections: null,
+    sniperSections: targetSections || [],
+    sniperTargetSeats: [],
+  };
+}
+
+async function prepareDestinationsInParallel(destinations, destAccountMap, url, targetSections, options = {}) {
+  // Prepare all destination browsers in parallel, bounded by maxConcurrency.
+  // Returns { ready: [{ username, session, assignedSeats, seatsBySource }], failed: [{ username, error, assignedSeats }] }.
+  const PREPARE_TIMEOUT_MS = options.prepareTimeoutMs || 30_000;
+  const RETRY_DELAY_MS = options.retryDelayMs || 3_000;
+  const concurrency = options.maxConcurrency || maxConcurrency || 3;
+  const total = destinations.length;
+  const ready = [];
+  const failed = [];
+
+  async function prepareOne(destPlan, index, isRetry = false) {
+    const toUsername = destPlan.username;
+    const assignedSeats = destPlan.assignedSeats;
+    const seatsBySource = destPlan.seatsBySource;
+    const account = destAccountMap.get(toUsername) || { username: toUsername, useProxy: false };
+    const proxyDisplay = account.assignedProxy
+      ? account.assignedProxy.server
+      : (account.useProxy ? 'auto-proxy' : 'direct');
+
+    emitStatus('destination-preparing', `${isRetry ? 'Retry' : 'Preparing'} destination ${toUsername} with ${assignedSeats.length} seat(s)`, {
+      account: toUsername,
+      totalDestinations: total,
+      currentIndex: index + 1,
+      seats: assignedSeats,
+      proxy: proxyDisplay,
+      retry: isRetry,
+    });
+    fileLog('INFO', `[transfer-multi] [${index + 1}/${total}] ${isRetry ? 'Retry' : 'Preparing'} destination ${toUsername}: ${assignedSeats.length} seats, proxy=${proxyDisplay}`);
+
+    try {
+      const destSession = await withTimeout(
+        prepareDestinationForTransfer(toUsername, assignedSeats, account, {
+          url: account.url || url,
+          targetSections: account.targetSections || targetSections,
+        }),
+        PREPARE_TIMEOUT_MS,
+        `prepare destination ${toUsername}`
+      );
+      emitStatus('destination-ready', `Destination ${toUsername} is ready`, {
+        account: toUsername,
+        totalDestinations: total,
+        currentIndex: index + 1,
+        seats: assignedSeats,
+        proxy: proxyDisplay,
+      });
+      return { ok: true, username: toUsername, session: destSession, assignedSeats, seatsBySource };
+    } catch (prepErr) {
+      const errMsg = prepErr?.message || String(prepErr);
+      fileLog('WARN', `[transfer-multi] Failed to ${isRetry ? 'retry' : 'prepare'} destination ${toUsername}: ${errMsg}`);
+      emitStatus('destination-prepare-failed', `Could not ${isRetry ? 'retry' : 'prepare'} destination ${toUsername}: ${errMsg}`, { account: toUsername, error: errMsg, retry: isRetry });
+      return { ok: false, username: toUsername, error: errMsg, assignedSeats, seatsBySource };
+    }
+  }
+
+  // Process destinations in parallel with bounded concurrency using simple batches.
+  for (let i = 0; i < destinations.length; i += concurrency) {
+    const batch = destinations.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map((destPlan, idx) => prepareOne(destPlan, i + idx)));
+    for (const r of batchResults) {
+      if (r.ok) {
+        ready.push({ username: r.username, session: r.session, assignedSeats: r.assignedSeats, seatsBySource: r.seatsBySource });
+      } else {
+        failed.push({ username: r.username, error: r.error, assignedSeats: r.assignedSeats, seatsBySource: r.seatsBySource });
+      }
+    }
+  }
+
+  // Retry failed destinations once after a short delay.
+  if (failed.length > 0) {
+    fileLog('INFO', `[transfer-multi] Retrying ${failed.length} failed destination(s) after ${RETRY_DELAY_MS}ms`);
+    await waitFor(RETRY_DELAY_MS);
+    const retryResults = await Promise.all(failed.map((destPlan, idx) => prepareOne(destPlan, idx, true)));
+    for (const r of retryResults) {
+      // Remove from failed if retry succeeded, otherwise keep the original failure.
+      const existingIndex = failed.findIndex(f => f.username === r.username);
+      if (r.ok) {
+        if (existingIndex >= 0) failed.splice(existingIndex, 1);
+        ready.push({ username: r.username, session: r.session, assignedSeats: r.assignedSeats, seatsBySource: r.seatsBySource });
+      } else if (existingIndex >= 0) {
+        failed[existingIndex].error = r.error;
+      }
+    }
+  }
+
+  // Capture full-session snapshots for every ready destination so recovery/reuse
+  // paths have the cookies/storage they need.
+  for (const dest of ready) {
+    await backfillFullSession(dest.session);
+  }
+
+  return { ready, failed };
+}
+
+async function backfillFullSession(session) {
+  // Capture a full session snapshot from a live page so the destination can be
+  // recreated later if its active context is closed/lost.
+  if (!session || !session.page || !session.context) return false;
+  if (session.fullSession) return true;
+  try {
+    session.fullSession = await harvestFullSession(session.page, session.context, session.username);
+    fileLog('INFO', `[transfer-prep] Backfilled fullSession for ${session.username}`);
+    return true;
+  } catch (e) {
+    fileLog('WARN', `[transfer-prep] Could not backfill fullSession for ${session.username}: ${e.message}`);
+    return false;
+  }
+}
+
+async function validateTransferDestinations(destinationAccounts, url, targetSections) {
+  // Pre-check every destination account before building a transfer plan.
+  // Failed destinations are recorded but do NOT stop the whole transfer.
+  if (!Array.isArray(destinationAccounts) || destinationAccounts.length === 0) return [];
+  const PREPARE_TIMEOUT_MS = 90_000;
+  const results = [];
+  for (const account of destinationAccounts) {
+    const toUsername = account.username;
+    emitStatus('destination-validating', `Validating destination ${toUsername} before transfer...`, { account: toUsername });
+
+    // Fast path 1: cached session.
+    const cached = await loadSessionFromCache(toUsername);
+    if (cached && validateSession(cached)) {
+      fileLog('INFO', `[validate] ${toUsername}: Using cached session`);
+      emitStatus('destination-valid', `Destination ${toUsername} ready from cached session`, { account: toUsername });
+      results.push({ username: toUsername, ready: true, method: 'cached-session' });
+      continue;
+    }
+
+    // Fast path 2: cookies provided.
+    if (account.rawCookies || account.structuredCookies || account.type === 'holdToken') {
+      fileLog('INFO', `[validate] ${toUsername}: Has cookies/holdToken, marking as ready`);
+      emitStatus('destination-valid', `Destination ${toUsername} ready via cookies`, { account: toUsername });
+      results.push({ username: toUsername, ready: true, method: 'cookies' });
+      continue;
+    }
+
+    // Fallback: try login.
+    try {
+      const launchAccount = {
+        ...account,
+        url: account.url || url,
+        targetSections: account.targetSections || targetSections,
+      };
+      await withTimeout(
+        prepareDestinationForTransfer(toUsername, [], account, { url: account.url || url, targetSections: account.targetSections || targetSections }),
+        PREPARE_TIMEOUT_MS,
+        `validate destination ${toUsername}`
+      );
+      emitStatus('destination-valid', `Destination ${toUsername} is ready`, { account: toUsername });
+      results.push({ username: toUsername, ready: true, method: 'login' });
+    } catch (err) {
+      const errMsg = err?.message || String(err);
+      fileLog('WARN', `[validate] ${toUsername}: FAILED - ${errMsg}`);
+      emitStatus('destination-invalid', `Destination ${toUsername} cannot be prepared: ${errMsg}`, { account: toUsername, error: errMsg });
+      results.push({ username: toUsername, ready: false, error: errMsg, method: 'failed' });
+      // Do NOT throw - continue validating the remaining destinations.
+    }
+  }
+  return results;
+}
+
+async function holdSpecificSeatsWithMonitor(page, seatLabels, username, session, timeoutMs = 30000) {
+  // Repeatedly attempt to hold a fixed list of seats until all are held or timeout.
+  const wanted = [...new Set((seatLabels || []).map(String).filter(Boolean))];
+  if (!wanted.length) return { held: [], missing: [] };
+  const deadline = Date.now() + timeoutMs;
+  const speed = getSpeedSettings(session?.speedSettings);
+  const held = [];
+  const heldSet = new Set();
+  let attempts = 0;
+  while (Date.now() < deadline) {
+    const stillWanted = wanted.filter(s => !heldSet.has(s));
+    if (!stillWanted.length) break;
+    attempts++;
+    emitStatus('transfer-monitor-hold', `Monitoring hold attempt ${attempts} for ${stillWanted.length} seat(s)`, { account: username, seats: stillWanted });
+    const batch = await sendHoldViaRoute(page, stillWanted, {
+      fastMode: true,
+      timeoutMs: Math.min(2000, speed.sniperTimeoutMs || 1500),
+      gapMs: speed.sniperBurstGapMs || 30,
+      username,
+      token: session?.holdToken,
+      speedSettings: session?.speedSettings,
+      session,
+    });
+    for (const s of batch) {
+      if (!heldSet.has(s)) {
+        heldSet.add(s);
+        held.push(s);
+      }
+    }
+    if (heldSet.size < wanted.length) await waitFor(250);
+  }
+  const missing = wanted.filter(s => !heldSet.has(s));
+  return { held, missing };
+}
+
+async function resolveTransferBatchSize(eventUrl) {
+  let maxTicketsPerUser = 30;
+  try {
+    const slug = parseSlug(eventUrl);
+    const detail = await fetchChartSections(slug);
+    maxTicketsPerUser = detail?.maxTicketsPerUser || 30;
+  } catch (e) {
+    fileLog('WARN', `Could not resolve maxTicketsPerUser for transfer batch size: ${e.message}`);
+  }
+  return Math.max(1, Math.min(5, maxTicketsPerUser));
+}
+
+async function transferBatchAtomicOrAuto(sourceSession, destSession, batch, opts) {
+  const { fromUsername, toUsername, batchNum, batchCount, maxBatchRetries, sniperMode, destProxy, mode } = opts;
+
+  emitStatus('transfer-batch-start', `Batch ${batchNum}/${batchCount}: moving ${batch.length} seat(s)`, { from: fromUsername, to: toUsername, batch, batchNum, batchCount, sniperMode });
+  emitStatus('transfer-batch-proxy', `Batch ${batchNum}/${batchCount} using proxy ${destProxy ? destProxy.server : 'direct'}`, { account: toUsername, proxy: destProxy ? destProxy.server : null, batch, batchNum, batchCount });
+
+  // 1) Release batch from source in a single WebSocket message.
+  const releasedBatch = await releaseSeatsBatch(sourceSession, batch);
+  await waitFor(50);
+  sourceSession.selectedSeats = sourceSession.selectedSeats.filter(s => !batch.includes(s));
+  for (const seat of batch) releaseSeatFromPool(seat);
+  if (releasedBatch.length < batch.length) {
+    fileLog('WARN', `[${fromUsername}] Batch ${batchNum}: released ${releasedBatch.length}/${batch.length} seats`);
+  }
+
+  // 2) Destination grabs the released seats (atomic attempt).
+  let heldBatch = [];
+  if (sniperMode) {
+    await waitFor(800);
+    let verified = await verifyHeldSeatsViaApi(destSession.page, destSession.holdToken, batch, { session: destSession });
+    if (verified.length < batch.length) {
+      const monitorRes = await holdSpecificSeatsWithMonitor(destSession.page, batch, toUsername, destSession, 6000);
+      for (const s of monitorRes.held) {
+        if (!verified.includes(s)) verified.push(s);
+      }
+    }
+    heldBatch = verified;
+  } else {
+    for (let attempt = 0; attempt < maxBatchRetries && heldBatch.length < batch.length; attempt++) {
+      if (attempt > 0) {
+        emitStatus('transfer-batch-retry', `Batch ${batchNum}/${batchCount}: retry ${attempt}/${maxBatchRetries}`, { from: fromUsername, to: toUsername, batch, attempt });
+        await waitFor(150 * (attempt + 1));
+      }
+      heldBatch = await holdSpecificSeatsViaWebSocket(destSession.page, batch, toUsername, destSession);
+    }
+  }
+
+  let usedMode = 'atomic';
+
+  // 3) Auto fallback: if atomic failed, retry the whole batch in legacy mode once.
+  if (mode === 'auto' && heldBatch.length < batch.length) {
+    usedMode = 'legacy';
+    emitStatus('transfer-fallback', `Batch ${batchNum}: atomic held ${heldBatch.length}/${batch.length}, switching to legacy`, { from: fromUsername, to: toUsername, batch, batchNum, batchCount });
+
+    // Recover missing seats back to source so the source can re-release the full batch.
+    const missingAfterAtomic = batch.filter(s => !heldBatch.includes(s));
+    if (missingAfterAtomic.length) {
+      emitStatus('transfer-recover', `Recovering ${missingAfterAtomic.length} seat(s) back to source before legacy fallback`, { from: fromUsername, to: toUsername, seats: missingAfterAtomic });
+      const recoveredMissing = await holdSpecificSeatsViaWebSocket(sourceSession.page, missingAfterAtomic, fromUsername, sourceSession);
+      for (const seat of recoveredMissing) {
+        if (!sourceSession.selectedSeats.includes(seat)) sourceSession.selectedSeats.push(seat);
+      }
+    }
+
+    // Release seats that the destination did hold so the source can reclaim them.
+    if (heldBatch.length) {
+      emitStatus('transfer-fallback-release', `Releasing ${heldBatch.length} seat(s) from destination for legacy retry`, { account: toUsername, batch, batchNum, batchCount });
+      const releasedFromDest = await releaseSeatsBatch(destSession, heldBatch);
+      await waitFor(50);
+      destSession.selectedSeats = destSession.selectedSeats.filter(s => !heldBatch.includes(s));
+      const recoveredFromDest = await holdSpecificSeatsViaWebSocket(sourceSession.page, releasedFromDest, fromUsername, sourceSession);
+      for (const seat of recoveredFromDest) {
+        if (!sourceSession.selectedSeats.includes(seat)) sourceSession.selectedSeats.push(seat);
+      }
+    }
+
+    // If source now holds the full batch, release it all at once and let the destination re-hold.
+    const sourceHoldsFullBatch = batch.every(s => sourceSession.selectedSeats.includes(s));
+    if (sourceHoldsFullBatch) {
+      try {
+        await releaseSeatsBatch(sourceSession, batch);
+        await waitFor(50);
+        sourceSession.selectedSeats = sourceSession.selectedSeats.filter(s => !batch.includes(s));
+        for (const seat of batch) releaseSeatFromPool(seat);
+        const legacyHeld = await holdSpecificSeatsViaWebSocket(destSession.page, batch, toUsername, destSession);
+        heldBatch = legacyHeld;
+      } catch (legacyErr) {
+        emitStatus('transfer-legacy-error', `Batch ${batchNum}: legacy fallback error ${legacyErr.message}`, { from: fromUsername, to: toUsername, batch, batchNum, batchCount });
+      }
+    } else {
+      fileLog('WARN', `[${fromUsername}] Batch ${batchNum}: cannot retry legacy because source does not hold full batch`);
+    }
+  }
+
+  // 4) Recover any seats the destination could not grab back to the source.
+  const missingInBatch = batch.filter(s => !heldBatch.includes(s));
+  if (missingInBatch.length > 0) {
+    emitStatus('transfer-recover', `Recovering ${missingInBatch.length} seat(s) back to source`, { from: fromUsername, to: toUsername, seats: missingInBatch });
+    const recovered = await holdSpecificSeatsViaWebSocket(sourceSession.page, missingInBatch, fromUsername, sourceSession);
+    for (const seat of recovered) {
+      if (!sourceSession.selectedSeats.includes(seat)) sourceSession.selectedSeats.push(seat);
+    }
+    reserveSeats(fromUsername, sourceSession.selectedSeats);
+  }
+
+  emitStatus('transfer-batch-complete', `Batch ${batchNum}/${batchCount}: moved ${heldBatch.length}/${batch.length} (mode: ${usedMode})`, { from: fromUsername, to: toUsername, held: heldBatch, missing: missingInBatch, batchNum, batchCount, mode: usedMode });
+  return { heldBatch, usedMode };
+}
+
+async function atomicReleaseAndHold(sourceSession, destSession, seats) {
+  if (!seats || seats.length === 0) return { held: [], missing: [] };
+  const fromUsername = sourceSession.username;
+  const toUsername = destSession.username;
+  const transferId = transferAuditor.record({ stage: 'atomic-start', sourceUser: fromUsername, destinationUser: toUsername, seats, mode: 'atomic' });
+  const startMs = Date.now();
+  emitStatus('transfer-atomic', `Atomic transfer of ${seats.length} seat(s) from ${fromUsername} to ${toUsername}`, { from: fromUsername, to: toUsername, seats, transferId });
+
+  try {
+    // Ensure source systems are fully paused during the atomic window.
+    sourceSession.isTransferring = true;
+    if (sourceSession.holdInterval) {
+      clearInterval(sourceSession.holdInterval);
+      sourceSession.holdInterval = null;
+    }
+    stopActiveSniper(sourceSession);
+    clearHoldWatcher(sourceSession);
+
+    // Pre-warm destination chart frame/WebSocket route.
+    await findChartFrame(destSession.page, toUsername);
+    await waitFor(5);
+
+    // Step 1: release from source and confirm the seats left the source state.
+    const released = await releaseSeatsBatch(sourceSession, seats);
+    fileLog('INFO', `[transfer-atomic] Released ${released.length}/${seats.length} from source`);
+    if (released.length === 0) {
+      return { held: [], missing: seats };
+    }
+    // Give the server a deterministic window to process the release before holding.
+    await waitFor(30);
+
+    // Step 2: hold immediately on destination.
+    const held = await sendHoldViaRoute(destSession.page, released, {
+      fastMode: true,
+      timeoutMs: 3000,
+      gapMs: 10,
+      username: toUsername,
+      token: destSession.holdToken,
+      speedSettings: destSession.speedSettings,
+      session: destSession,
+    }).catch(err => {
+      fileLog('WARN', `[transfer-atomic] Destination hold error: ${err.message}`);
+      return [];
+    });
+
+    const heldSet = new Set(held);
+    const missing = released.filter(s => !heldSet.has(s));
+
+    // Retry once for any missing seats.
+    if (missing.length > 0) {
+      emitStatus('transfer-atomic-retry', `Retrying ${missing.length} missing seat(s) atomically`, { from: fromUsername, to: toUsername, seats: missing });
+      await waitFor(50);
+      const retryHeld = await sendHoldViaRoute(destSession.page, missing, {
+        fastMode: true,
+        timeoutMs: 3000,
+        gapMs: 10,
+        username: toUsername,
+        token: destSession.holdToken,
+        speedSettings: destSession.speedSettings,
+        session: destSession,
+      }).catch(() => []);
+      for (const s of retryHeld) heldSet.add(s);
+    }
+
+    const finalHeld = seats.filter(s => heldSet.has(s));
+    const finalMissing = seats.filter(s => !heldSet.has(s));
+    transferAuditor.record({ transferId, stage: 'atomic-result', sourceUser: fromUsername, destinationUser: toUsername, seats, held: finalHeld.length, missing: finalMissing.length, mode: 'atomic', durationMs: Date.now() - startMs });
+    emitStatus('transfer-atomic-result', `Atomic transfer: ${finalHeld.length}/${seats.length} held`, { from: fromUsername, to: toUsername, held: finalHeld, missing: finalMissing, transferId });
+    return { held: finalHeld, missing: finalMissing };
+  } catch (err) {
+    transferAuditor.record({ transferId, stage: 'atomic-error', sourceUser: fromUsername, destinationUser: toUsername, seats, held: 0, missing: seats.length, mode: 'atomic', durationMs: Date.now() - startMs, error: err.message });
+    fileLog('ERROR', `[transfer-atomic] Atomic transfer failed: ${err.message}`);
+    return { held: [], missing: seats };
+  } finally {
+    sourceSession.isTransferring = false;
+    // Keepalive was cleared during the atomic window; restart it so the source's
+    // remaining seats do not expire.
+    if (sourceSession.page && !sourceSession.stopRequested) {
+      startHoldKeepalive(sourceSession);
+    }
+  }
+}
+
+async function liveStreamAtomicReleaseAndHold(sourceSession, destSession, seats, opts = {}) {
+  // Coordinated simultaneous release/hold: the destination spams hold attempts in a
+  // tight loop while the source releases the exact same seats a few milliseconds later.
+  // This minimizes the public-pool window to roughly one network round-trip.
+  if (!seats || seats.length === 0) return { held: [], missing: [] };
+  const fromUsername = sourceSession.username;
+  const toUsername = destSession.username;
+  const maxAttempts = typeof opts.maxAttempts === 'number' ? opts.maxAttempts : 150;
+  const pollMs = typeof opts.pollMs === 'number' ? opts.pollMs : 10;
+  const releaseDelayMs = typeof opts.releaseDelayMs === 'number' ? opts.releaseDelayMs : 25;
+  const transferId = transferAuditor.record({ stage: 'livestream-start', sourceUser: fromUsername, destinationUser: toUsername, seats, mode: 'livestream' });
+  const startMs = Date.now();
+  emitStatus('transfer-livestream', `Live-stream atomic transfer of ${seats.length} seat(s) to ${toUsername}`, { from: fromUsername, to: toUsername, seats, transferId });
+
+  try {
+    // Pause source systems so it cannot reclaim the seats during the window.
+    sourceSession.isTransferring = true;
+    stopActiveSniper(sourceSession);
+    clearHoldWatcher(sourceSession);
+    if (sourceSession.holdInterval) {
+      clearInterval(sourceSession.holdInterval);
+      sourceSession.holdInterval = null;
+    }
+    // Prevent the source sniper from ever targeting these seats again.
+    if (Array.isArray(sourceSession.sniperTargetSeats)) {
+      sourceSession.sniperTargetSeats = sourceSession.sniperTargetSeats.filter(s => !seats.includes(s));
+    }
+    // Mark seats as released immediately so no other account/sniper grabs them.
+    for (const s of seats) {
+      sourceSession.releasedSeats.add(String(s).trim().toUpperCase());
+      releaseSeatFromPool(s);
+    }
+
+    // Pre-warm destination chart/WebSocket route.
+    await findChartFrame(destSession.page, toUsername).catch(() => {});
+
+    const heldSet = new Set();
+    let loopFinished = false;
+
+    const holdLoop = (async () => {
+      for (let i = 0; i < maxAttempts && !loopFinished; i++) {
+        const still = seats.filter(s => !heldSet.has(s));
+        if (!still.length) break;
+        try {
+          const batch = await sendHoldViaRoute(destSession.page, still, {
+            fastMode: true,
+            timeoutMs: 1500,
+            gapMs: 5,
+            username: toUsername,
+            token: destSession.holdToken,
+            speedSettings: destSession.speedSettings,
+            session: destSession,
+          });
+          for (const s of batch) heldSet.add(s);
+        } catch {}
+        if (heldSet.size < seats.length) await waitFor(pollMs);
+      }
+    })();
+
+    // Let the destination loop start firing, then release from source.
+    await waitFor(releaseDelayMs);
+    const released = await releaseSeatsBatch(sourceSession, seats);
+
+    // Wait for the loop to capture the seats (or timeout).
+    await Promise.race([holdLoop, waitFor(maxAttempts * pollMs + 2000)]);
+    loopFinished = true;
+
+    const held = seats.filter(s => heldSet.has(s));
+    const missing = seats.filter(s => !heldSet.has(s));
+
+    // Update source state so keepalive/sniper do not fight for transferred seats.
+    if (held.length) {
+      sourceSession.selectedSeats = sourceSession.selectedSeats.filter(s => !held.includes(s));
+      for (const s of held) {
+        const key = String(s).trim().toUpperCase();
+        sourceSession.releasedSeats.add(key);
+        releaseSeatFromPool(s);
+      }
+    }
+    // Any seats the destination could not grab should be reclaimable by the source.
+    if (missing.length) {
+      for (const s of missing) {
+        const key = String(s).trim().toUpperCase();
+        sourceSession.releasedSeats.delete(key);
+      }
+    }
+
+    transferAuditor.record({ transferId, stage: 'livestream-result', sourceUser: fromUsername, destinationUser: toUsername, seats, held: held.length, missing: missing.length, mode: 'livestream', durationMs: Date.now() - startMs });
+    emitStatus('transfer-livestream-result', `Live-stream transfer: ${held.length}/${seats.length} held`, { from: fromUsername, to: toUsername, held, missing, transferId });
+    return { held, missing };
+  } catch (err) {
+    transferAuditor.record({ transferId, stage: 'livestream-error', sourceUser: fromUsername, destinationUser: toUsername, seats, held: 0, missing: seats.length, mode: 'livestream', durationMs: Date.now() - startMs, error: err.message });
+    fileLog('ERROR', `[transfer-livestream] ${fromUsername} -> ${toUsername}: ${err.message}`);
+    return { held: [], missing: seats };
+  } finally {
+    sourceSession.isTransferring = false;
+    // Restart keepalive so the source's remaining seats stay extended.
+    if (sourceSession.page && !sourceSession.stopRequested) {
+      startHoldKeepalive(sourceSession);
+    }
+  }
+}
+
+async function legacyReleaseAndHold(sourceSession, destSession, seats) {
+  if (!seats || seats.length === 0) return { held: [], missing: [] };
+  const fromUsername = sourceSession.username;
+  const toUsername = destSession.username;
+  emitStatus('transfer-legacy', `Legacy transfer of ${seats.length} seat(s) from ${fromUsername} to ${toUsername}`, { from: fromUsername, to: toUsername, seats });
+
+  try {
+    const released = await releaseSeatsBatch(sourceSession, seats);
+    await waitFor(200);
+    sourceSession.selectedSeats = sourceSession.selectedSeats.filter(s => !seats.includes(s));
+    for (const seat of seats) releaseSeatFromPool(seat);
+
+    const held = await sendHoldViaRoute(destSession.page, seats, {
+      fastMode: true,
+      timeoutMs: 5000,
+      gapMs: 20,
+      username: toUsername,
+      token: destSession.holdToken,
+      speedSettings: destSession.speedSettings,
+      session: destSession,
+    }).catch(() => []);
+    const heldSet = new Set(held);
+    const missing = seats.filter(s => !heldSet.has(s));
+    emitStatus('transfer-legacy-result', `Legacy transfer: ${held.length}/${seats.length} held`, { from: fromUsername, to: toUsername, held, missing });
+    return { held, missing };
+  } catch (err) {
+    fileLog('ERROR', `[transfer-legacy] Legacy transfer failed: ${err.message}`);
+    return { held: [], missing: seats };
+  }
+}
+
+async function transferSeatsToDestination(sourceSession, destSession, opts = {}) {
+  const requestedMode = opts.mode === 'legacy' ? 'legacy' : (opts.mode === 'auto' ? 'auto' : 'atomic');
+  const batchSize = opts.batchSize
+    ? Math.max(1, Math.min(parseInt(opts.batchSize, 10) || 5, 10))
+    : await resolveTransferBatchSize(opts.url || sourceSession.url || destSession.url || '');
+  const maxBatchRetries = Math.max(1, Math.min(parseInt(opts.maxBatchRetries, 10) || 2, 5));
+  const fixedSeats = Array.isArray(opts.fixedSeats) && opts.fixedSeats.length ? opts.fixedSeats : null;
+  if (!fixedSeats) throw new Error('fixedSeats array is required for transferSeatsToDestination');
+
+  const fromUsername = sourceSession.username;
+  const toUsername = destSession.username;
+  const sniperMode = opts.sniperMode === true;
+
+  // Transaction isolation: lock both accounts during the transfer.
+  if (sourceSession.isSelecting || destSession.isSelecting) {
+    throw new Error('ACCOUNT_BUSY: one of the accounts is already in a selecting/transfer operation');
+  }
+  sourceSession.isSelecting = true;
+  // In sniper mode the destination sniper must remain active, so we only mark it
+  // as transferring (not selecting) and allow the sniper loop to grab released seats.
+  if (sniperMode) {
+    destSession.isTransferring = true;
+  } else {
+    destSession.isSelecting = true;
+  }
+
+  // Guard: prevent source WS listeners/sniper from reclaiming released seats.
+  sourceSession.isTransferring = true;
+  sourceSession.__transferTarget = toUsername;
+  whitelistForTransfer([fromUsername, toUsername]);
+  pauseSnipersForSections(fixedSeats);
+
+  try {
+    emitStatus('transfer-start', `Transferring seats from ${fromUsername} to ${toUsername} (${requestedMode} mode)`, { from: fromUsername, to: toUsername, mode: requestedMode, batchSize });
+
+    // Defensive: ensure keepalive/sniper are fully paused for the source.
+    if (sourceSession.holdInterval) {
+      clearInterval(sourceSession.holdInterval);
+      sourceSession.holdInterval = null;
+    }
+    stopActiveSniper(sourceSession);
+    clearHoldWatcher(sourceSession);
+
+    // 1. Verify/resolve destination proxy using only the account's own proxy
+    // decision. The global proxy mode must not override a direct account during
+    // a transfer; proxy logic for transfers is isolated from account proxy logic.
+    let destProxy = destSession.proxy;
+    let destProxyMode = destSession.proxyMode || 'off';
+    if (destProxy || destSession.proxyMode === 'forced' || destSession.proxyMode === 'required') {
+      const proxyTest = destProxy ? await testProxy(destProxy, 5000) : { ok: false };
+      if (!proxyTest.ok) {
+        const resolved = await resolveProxyForAccount(toUsername, destSession.proxyMode === 'forced' || destSession.proxyMode === 'required');
+        if (resolved.proxy) {
+          destProxy = resolved.proxy;
+          destProxyMode = resolved.mode;
+          destSession.proxy = destProxy;
+          destSession.proxyMode = destProxyMode;
+          emitStatus('transfer-proxy-failover', `Destination proxy updated for ${toUsername}: ${destProxy.server}`, { account: toUsername, proxy: destProxy.server, mode: destProxyMode });
+        } else if (destSession.proxyMode === 'required' || destSession.proxyMode === 'forced') {
+          throw new Error(`DESTINATION_PROXY_REQUIRED: No working proxy for ${toUsername}`);
+        }
+      }
+    }
+    emitStatus('transfer-proxy-start', `Destination ${toUsername} using proxy ${destProxy ? destProxy.server : 'direct'}`, { account: toUsername, proxy: destProxy ? destProxy.server : null, mode: destProxyMode });
+
+    // 2. Verify the fixed seats are still held by the source.
+    const snapshot = await verifyHeldSeatsViaApi(sourceSession.page, sourceSession.holdToken, fixedSeats, { session: sourceSession });
+    if (!snapshot.length) throw new Error('Source account has no verified seats to transfer');
+
+    // 3. Reserve seats in global pool so other accounts cannot grab them during transfer.
+    reserveSeats(toUsername, snapshot);
+
+    // 4. Stop the source sniper and pause keepalive so the source does not
+    // reclaim seats while the destination is trying to hold them.
+    stopActiveSniper(sourceSession);
+    stopActiveSniper(destSession);
+    pauseKeepalive(sourceSession);
+    pauseKeepalive(destSession);
+
+    // 5. Destination must be on the booking page with a live chart.
+    const destFrame = await findChartFrame(destSession.page, toUsername);
+    if (!destFrame) throw new Error('Destination chart is not ready');
+
+    destSession.targetSeatCount = Math.max(destSession.targetSeatCount || 0, snapshot.length);
+
+    let finalSeats = [];
+    let releasedAll = false;
+    const batchCount = Math.ceil(snapshot.length / batchSize);
+    const sniperMode = opts.sniperMode === true;
+
+    if (requestedMode === 'legacy') {
+      // Legacy mode: release all fixed seats from source in one batch then have destination re-hold them.
+      let released = false;
+      try {
+        await releaseSeatsBatch(sourceSession, snapshot);
+        await waitFor(50);
+        sourceSession.selectedSeats = sourceSession.selectedSeats.filter(s => !snapshot.includes(s));
+        for (const seat of snapshot) releaseSeatFromPool(seat);
+        released = true;
+        emitAccountUpdate(fromUsername, 'idle', { seats: sourceSession.selectedSeats });
+      } catch (e) {
+        throw new Error(`Failed to release source seats: ${e.message}`);
+      }
+      releasedAll = released;
+
+      const heldByDest = await holdSpecificSeatsViaWebSocket(destSession.page, snapshot, toUsername, destSession);
+      finalSeats = heldByDest;
+      if (heldByDest.length < snapshot.length) {
+        const missing = snapshot.filter(s => !heldByDest.includes(s));
+        const needed = snapshot.length - heldByDest.length;
+        emitStatus('transfer-refill', `Refilling ${needed} missing seat(s) on destination`, { from: fromUsername, to: toUsername, missing });
+        const refill = await selectSeatsViaWebSocket(destSession.page, destSession.targetSections || [], needed, toUsername, destSession);
+        finalSeats = [...new Set([...heldByDest, ...refill])];
+      }
+    } else {
+      // Atomic mode (or auto): release per batch then immediately re-hold on destination.
+      // If mode is 'auto' and atomic fails for a batch, fall back to legacy for that batch.
+      const transferred = [];
+      const lost = [];
+      const batchModes = [];
+
+      for (let i = 0; i < snapshot.length; i += batchSize) {
+        const batch = snapshot.slice(i, i + batchSize);
+        const batchNum = Math.floor(i / batchSize) + 1;
+        const { heldBatch, usedMode } = await transferBatchAtomicOrAuto(sourceSession, destSession, batch, {
+          fromUsername,
+          toUsername,
+          batchNum,
+          batchCount,
+          maxBatchRetries,
+          sniperMode,
+          destProxy,
+          mode: requestedMode,
+        });
+        transferred.push(...heldBatch);
+        batchModes.push(usedMode);
+        for (const seat of batch) {
+          if (!heldBatch.includes(seat) && !sourceSession.selectedSeats.includes(seat)) lost.push(seat);
+        }
+      }
+
+      // Refill any seats still missing on destination using fresh seats.
+      finalSeats = transferred;
+      if (transferred.length < snapshot.length) {
+        const needed = snapshot.length - transferred.length;
+        emitStatus('transfer-refill', `Refilling ${needed} missing seat(s) on destination`, { from: fromUsername, to: toUsername, missing: lost });
+        const refill = await selectSeatsViaWebSocket(destSession.page, destSession.targetSections || [], needed, toUsername, destSession);
+        finalSeats = [...new Set([...transferred, ...refill])];
+      }
+
+      // Final recovery pass: any seat that is neither held by destination nor
+      // already recovered back to source is returned to the master account.
+      let finalMissing = snapshot.filter(s => !finalSeats.includes(s) && !sourceSession.selectedSeats.includes(s));
+      if (finalMissing.length > 0) {
+        emitStatus('transfer-final-recovery', `Final recovery: attempting to return ${finalMissing.length} seat(s) to source`, { from: fromUsername, to: toUsername, seats: finalMissing });
+        const recoveredFinal = await holdSpecificSeatsViaWebSocket(sourceSession.page, finalMissing, fromUsername, sourceSession);
+        if (recoveredFinal.length > 0) {
+          for (const seat of recoveredFinal) {
+            if (!sourceSession.selectedSeats.includes(seat)) sourceSession.selectedSeats.push(seat);
+          }
+          reserveSeats(fromUsername, sourceSession.selectedSeats);
+          emitStatus('transfer-final-recovered', `Final recovery returned ${recoveredFinal.length}/${finalMissing.length} seat(s) to source`, { from: fromUsername, seats: recoveredFinal });
+        }
+      }
+
+      releasedAll = true;
+      if (requestedMode === 'auto' && batchModes.includes('legacy')) {
+        fileLog('INFO', `[transfer] Used atomic+legacy fallback for ${batchModes.filter(m => m === 'legacy').length}/${batchCount} batch(es)`);
+      }
+    }
+
+    // 6. Finalize source state and global seat pool.
+    // Seats that the destination actually held (subset of snapshot) are removed
+    // from the source; seats recovered back to the source are kept.
+    const seatsMovedToDestination = snapshot.filter(s => finalSeats.includes(s));
+    sourceSession.selectedSeats = sourceSession.selectedSeats.filter(s => !seatsMovedToDestination.includes(s));
+    for (const seat of snapshot) {
+      if (!sourceSession.selectedSeats.includes(seat)) releaseSeatFromPool(seat);
+    }
+
+    // After a successful transfer, lower the source's target so it does not try
+    // to refill seats that now belong to the destination. This prevents the
+    // source and destination from fighting over the same seats during keepalive.
+    sourceSession.targetSeatCount = sourceSession.selectedSeats.length;
+    if (sourceSession.sniperSections) {
+      // Do not let the source sniper hunt in sections where it no longer holds seats.
+      sourceSession.sniperSections = (sourceSession.sniperSections || []).filter(s =>
+        sourceSession.selectedSeats.some(seat => String(seat).split('-')[0].toUpperCase() === s)
+      );
+    }
+
+    // 7. Set destination's selected seats to the actually held seats and reserve them.
+    destSession.selectedSeats = finalSeats;
+    destSession.targetSeatCount = finalSeats.length;
+    reserveSeats(toUsername, finalSeats);
+
+    // Sync both source and destination chart UIs so the operator sees the moved
+    // seats immediately instead of stale selections.
+    try {
+      const destFrame = await findChartFrame(destSession.page, toUsername);
+      if (destFrame) {
+        await syncChartSelection(destFrame, finalSeats, { page: destSession.page, username: toUsername });
+      }
+    } catch (syncErr) {
+      fileLog('WARN', `[${toUsername}] Transfer destination chart sync warning: ${syncErr.message}`);
+    }
+    try {
+      const srcFrame = await findChartFrame(sourceSession.page, fromUsername);
+      if (srcFrame) {
+        await syncChartSelection(srcFrame, sourceSession.selectedSeats, { page: sourceSession.page, username: fromUsername });
+      }
+    } catch (syncErr) {
+      fileLog('WARN', `[${fromUsername}] Transfer source chart sync warning: ${syncErr.message}`);
+    }
+
+    const recoveredSeats = snapshot.filter(s => sourceSession.selectedSeats.includes(s) && !finalSeats.includes(s));
+    const missingSeats = snapshot.filter(s => !finalSeats.includes(s) && !sourceSession.selectedSeats.includes(s));
+
+    emitStatus('transfer-proxy-complete', `Transferred ${finalSeats.length} seat(s) with proxy ${destProxy ? destProxy.server : 'direct'}`, { account: toUsername, from: fromUsername, proxy: destProxy ? destProxy.server : null, seats: finalSeats });
+    emitStatus('transfer-done', `Transferred ${finalSeats.length} seat(s) from ${fromUsername} to ${toUsername}`, {
+      from: fromUsername,
+      to: toUsername,
+      seats: finalSeats,
+      recovered: recoveredSeats,
+      missing: missingSeats,
+      mode: requestedMode,
+      releasedAll,
+      proxy: destProxy ? destProxy.server : null,
+    });
+    emitAccountUpdate(fromUsername, 'idle', { seats: sourceSession.selectedSeats });
+    emitAccountUpdate(toUsername, 'paused', { seats: finalSeats });
+
+    // 8. Restart sniper on destination so it keeps monitoring.
+    if (!destSession.stopRequested) {
+      startActiveSniper(destSession, destSession.targetSections);
+    }
+
+    // 9. Return result.
+    return {
+      success: true,
+      from: fromUsername,
+      to: toUsername,
+      transferredSeats: finalSeats,
+      recoveredSeats,
+      missingSeats,
+      mode: requestedMode,
+      destinationProxy: destProxy ? destProxy.server : null,
+    };
+  } finally {
+    sourceSession.isTransferring = false;
+    sourceSession.isSelecting = false;
+    sourceSession.__transferTarget = null;
+    removeFromTransferWhitelist(toUsername);
+    removeFromTransferWhitelist(fromUsername);
+    resumeKeepalive(sourceSession);
+    resumeKeepalive(destSession);
+    resumePausedTransferSnipers();
+    if (sniperMode) {
+      destSession.isTransferring = false;
+    } else {
+      destSession.isSelecting = false;
+    }
+  }
+}
+
+async function transferSeatsBetweenAccounts(fromUsername, toUsername, opts = {}) {
   const source = activeSessions.get(fromUsername);
   const dest = activeSessions.get(toUsername);
   if (!source) throw new Error('Source account has no active session');
   if (!dest) throw new Error('Destination account has no active session');
-  if (!source.selectedSeats || source.selectedSeats.length === 0) throw new Error('Source account is not holding any seats');
+
+  const fixedSeats = Array.isArray(opts.fixedSeats) && opts.fixedSeats.length ? opts.fixedSeats : null;
+  const sourceSeats = fixedSeats || source.selectedSeats;
+  if (!sourceSeats || sourceSeats.length === 0) throw new Error('Source account is not holding any seats');
 
   const blockedStates = ['payment', 'payment-ready', 'done'];
   if (blockedStates.includes(source.state) || blockedStates.includes(dest.state)) {
@@ -4287,80 +6476,956 @@ async function transferSeatsBetweenAccounts(fromUsername, toUsername) {
   transferLocks.add(fromUsername);
 
   try {
-    emitStatus('transfer-start', `Transferring seats from ${fromUsername} to ${toUsername}`, { from: fromUsername, to: toUsername });
-
-    // 1. Snapshot seats actually held by source.
-    const snapshot = await verifyHeldSeatsViaApi(source.page, source.holdToken, source.selectedSeats, { session: source });
-    if (!snapshot.length) throw new Error('Source account has no verified seats to transfer');
-
-    // 2. Stop the source sniper so it does not fight the destination.
-    stopActiveSniper(source);
-
-    // 3. Destination must be on the booking page with a live chart.
-    const destFrame = await findChartFrame(dest.page, toUsername);
-    if (!destFrame) throw new Error('Destination chart is not ready');
-
-    // 4. Release source seats.
-    let released = false;
-    try {
-      released = await releaseHold(source);
-      releaseSeats(fromUsername);
-      source.selectedSeats = [];
-      emitAccountUpdate(fromUsername, 'idle', { seats: [] });
-    } catch (e) {
-      throw new Error(`Failed to release source seats: ${e.message}`);
-    }
-
-    // 5. Have destination re-hold the same seats.
-    dest.targetSeatCount = Math.max(dest.targetSeatCount || 0, snapshot.length);
-    const heldByDest = await holdSpecificSeatsViaWebSocket(dest.page, snapshot, toUsername, dest);
-
-    // 6. Refill any seats the destination could not hold.
-    let finalSeats = heldByDest;
-    if (heldByDest.length < snapshot.length) {
-      const missing = snapshot.filter(s => !heldByDest.includes(s));
-      const needed = snapshot.length - heldByDest.length;
-      emitStatus('transfer-refill', `Refilling ${needed} missing seat(s) on destination`, { from: fromUsername, to: toUsername, missing });
-      const refill = await selectSeatsViaWebSocket(dest.page, dest.targetSections || [], needed, toUsername, dest);
-      finalSeats = [...new Set([...heldByDest, ...refill])];
-    }
-
-    dest.selectedSeats = finalSeats;
-    reserveSeats(toUsername, finalSeats);
-    emitStatus('transfer-done', `Transferred ${finalSeats.length} seat(s) from ${fromUsername} to ${toUsername}`, {
-      from: fromUsername,
-      to: toUsername,
-      seats: finalSeats,
-      missing: snapshot.filter(s => !finalSeats.includes(s)),
-    });
-    emitAccountUpdate(toUsername, 'paused', { seats: finalSeats });
-
-    // 7. Restart sniper on destination so it keeps monitoring.
-    startActiveSniper(dest, dest.targetSections);
-
-    return {
-      success: true,
-      from: fromUsername,
-      to: toUsername,
-      transferredSeats: finalSeats,
-      missingSeats: snapshot.filter(s => !finalSeats.includes(s)),
-    };
+    return await transferSeatsToDestination(source, dest, { ...opts, fixedSeats: sourceSeats });
   } finally {
     transferLocks.delete(fromUsername);
   }
 }
 
-// Transfer held seats from one active account to another.
+async function transferSeatsMulti(fromUsernames, toUsernames, opts = {}) {
+  const mode = opts.mode === 'legacy' ? 'legacy' : (opts.mode === 'atomic' ? 'atomic' : 'auto');
+  const batchSize = opts.batchSize ? Math.max(1, Math.min(parseInt(opts.batchSize, 10) || 5, 10)) : 5;
+  const maxBatchRetries = Math.max(1, Math.min(parseInt(opts.maxBatchRetries, 10) || 2, 5));
+  const url = opts.url;
+  const targetSections = opts.targetSections;
+  const destinationAccounts = Array.isArray(opts.destinationAccounts) ? opts.destinationAccounts : [];
+  const sniperMode = opts.sniperMode === true; // only true when the caller explicitly requests the plan flow
+  const distribution = opts.distribution === 'manual' ? 'manual' : 'auto';
+
+  // Support new API shape where opts may contain masterUsernames/destinations directly.
+  const masterUsernames = Array.isArray(opts.masterUsernames) && opts.masterUsernames.length
+    ? opts.masterUsernames
+    : fromUsernames;
+  const destinationSpecs = Array.isArray(opts.destinations) && opts.destinations.length
+    ? opts.destinations
+    : toUsernames.map(u => {
+        const existing = destinationAccounts.find(a => a.username === u);
+        return existing ? { ...existing, username: u } : { username: u, ticketCount: 0 };
+      });
+
+  if (!Array.isArray(masterUsernames) || masterUsernames.length === 0) {
+    throw new Error('masterUsernames/fromUsernames array required');
+  }
+  if (!Array.isArray(destinationSpecs) || destinationSpecs.length === 0) {
+    throw new Error('destinations/toUsernames array required');
+  }
+
+  // 1. Validate all sources are active sessions with held seats.
+  const sources = [];
+  for (const username of masterUsernames) {
+    const session = activeSessions.get(username);
+    if (!session) throw new Error(`Source account ${username} has no active session`);
+    if (!session.selectedSeats || session.selectedSeats.length === 0) {
+      throw new Error(`Source account ${username} is not holding any seats`);
+    }
+    sources.push(session);
+  }
+
+  // Add transferLocks protection per source session.
+  for (const session of sources) {
+    if (transferLocks.has(session.username)) {
+      throw new Error(`Transfer already in progress for source account ${session.username}`);
+    }
+  }
+  for (const session of sources) {
+    transferLocks.add(session.username);
+  }
+
+  // Exempt all transfer participants from section-contention checks so the
+  // destination(s) can receive seats from the source(s) without being blocked.
+  const transferParticipantUsernames = [
+    ...masterUsernames,
+    ...destinationSpecs.map(d => d.username),
+  ];
+  whitelistForTransfer(transferParticipantUsernames);
+
+  try {
+    fileLog('INFO', `[transfer-multi] Starting multi-transfer: masters=${masterUsernames.length}, destinations=${destinationSpecs.length}, mode=${mode}, sniperMode=${sniperMode}, distribution=${distribution}`);
+
+    // 2. Build transfer plan: verify seats, pool them, and assign to destinations.
+    const plan = await buildTransferPlan(sources, destinationSpecs, { mode, batchSize, maxBatchRetries });
+    const totalPlannedSeats = plan.destinations.reduce((s, d) => s + d.assignedSeats.length, 0);
+    fileLog('INFO', `[transfer-multi] Plan built: ${plan.masters.length} masters, ${plan.destinations.length} destinations, ${totalPlannedSeats} seats assigned`);
+    for (const m of plan.masters) {
+      fileLog('INFO', `[transfer-multi] Master ${m.username} contributes ${m.verifiedSeats.length} verified seats: ${m.verifiedSeats.join(', ')}`);
+    }
+    for (const d of plan.destinations) {
+      fileLog('INFO', `[transfer-multi] Destination ${d.username} assigned ${d.assignedSeats.length} seats: ${d.assignedSeats.join(', ')}`);
+    }
+    emitStatus('transfer-plan-built', `Transfer plan: ${plan.masters.length} masters, ${plan.destinations.length} destinations, ${totalPlannedSeats} seats`, {
+      masters: plan.masters.map(m => m.username),
+      destinations: plan.destinations.map(d => ({ username: d.username, count: d.assignedSeats.length })),
+      totalSeats: totalPlannedSeats,
+    });
+
+    // 3. Build a lookup of destination account configs. Proxy handling is
+    // intentionally isolated from the transfer logic: each destination launches
+    // using its own account-level proxy/direct setting (useProxy/assignedProxy).
+    // The transfer section never runs its own proxy test/assignment batch.
+    const toUsernames = destinationSpecs.map(d => d.username);
+    const destAccountMap = new Map();
+    for (const u of toUsernames) {
+      const existing = destinationAccounts.find(a => a.username === u);
+      const spec = destinationSpecs.find(d => d.username === u);
+      destAccountMap.set(u, {
+        username: u,
+        useProxy: existing && typeof existing.useProxy === 'boolean' ? existing.useProxy : false,
+        assignedProxy: existing?.assignedProxy || null,
+        url: existing?.url || url,
+        targetSections: existing?.targetSections || targetSections,
+        // Merge full account object (password, type, holdToken, etc.) if provided.
+        ...(existing || {}),
+        ...spec,
+      });
+    }
+
+    // 3b. Validate all destinations can actually log in / inject cookies BEFORE
+    // the master releases any seats. This prevents the "23 seats lost to 2FA"
+    // scenario seen in the logs. Failed destinations are skipped instead of
+    // aborting the whole transfer.
+    const validationResults = await validateTransferDestinations(destinationAccounts, url, targetSections);
+    const validDestUsernames = new Set(validationResults.filter(r => r.ready).map(r => r.username));
+    const invalidDestinations = validationResults.filter(r => !r.ready);
+    if (invalidDestinations.length) {
+      fileLog('WARN', `[transfer-multi] ${invalidDestinations.length} destination(s) failed validation: ${invalidDestinations.map(d => `${d.username} (${d.error})`).join('; ')}`);
+      emitStatus('transfer-validation-skipped', `Skipping ${invalidDestinations.length} invalid destination(s)`, { skipped: invalidDestinations.map(d => d.username) });
+    }
+    const filteredDestinationSpecs = destinationSpecs.filter(d => validDestUsernames.has(d.username));
+    if (filteredDestinationSpecs.length === 0) {
+      throw new Error('TRANSFER_NO_VALID_DESTINATIONS: all destinations failed validation');
+    }
+
+    // Rebuild the plan with only validated destinations so the master never
+    // reserves seats for a destination that cannot receive them.
+    const validatedPlan = await buildTransferPlan(sources, filteredDestinationSpecs, { mode, batchSize, maxBatchRetries });
+    plan.destinations = validatedPlan.destinations;
+
+    // 4. Show the seat distribution preview immediately so the operator sees
+    // which destination will receive which seats before any browser opens.
+    const distributionPreview = plan.destinations.map(d => {
+      const account = destAccountMap.get(d.username) || {};
+      const proxy = account.assignedProxy || null;
+      return {
+        username: d.username,
+        seats: d.assignedSeats,
+        seatsBySource: d.seatsBySource,
+        proxy: proxy ? proxy.server : (account.useProxy ? 'auto' : 'direct'),
+      };
+    });
+    emitStatus('transfer-distribution-preview', `Seat distribution ready: ${totalPlannedSeats} seats across ${plan.destinations.length} destination(s)`, {
+      totalSeats: totalPlannedSeats,
+      destinations: distributionPreview,
+    });
+    fileLog('INFO', `[transfer-multi] Distribution preview: ${JSON.stringify(distributionPreview.map(d => ({ user: d.username, count: d.seats.length, proxy: d.proxy, seats: d.seats })))}`);
+
+    // 5. Prepare all destination browsers in parallel (bounded by maxConcurrency),
+    // then transfer seats sequentially. Parallel prep cuts total preparation time
+    // from N * t to roughly t, while sequential transfer avoids multiple sources
+    // releasing seats at the exact same moment.
+    const PREPARE_TIMEOUT_MS = 90_000;
+    const prepareConcurrency = Math.max(1, maxConcurrency || 3);
+    const { ready: readyDestinations, failed: failedDestinations } = await prepareDestinationsInParallel(
+      plan.destinations,
+      destAccountMap,
+      url,
+      targetSections,
+      { prepareTimeoutMs: PREPARE_TIMEOUT_MS, maxConcurrency: prepareConcurrency }
+    );
+
+    // 5b. Re-balance seats from failed destinations onto ready destinations.
+    let activeDestinations = readyDestinations.slice();
+    if (failedDestinations.length > 0) {
+      const failedSeats = failedDestinations.flatMap(d => d.assignedSeats || []);
+      fileLog('WARN', `[transfer-multi] ${failedDestinations.length} destination(s) failed to prepare; attempting to re-distribute ${failedSeats.length} seats`);
+      emitStatus('transfer-rebalance-start', `Re-distributing ${failedSeats.length} seat(s) from failed destinations`, { failed: failedDestinations.map(d => d.username), seatCount: failedSeats.length });
+
+      // Rebuild seat -> source map from the original plan so rebalanced seats keep their source attribution.
+      const sourceMap = new Map();
+      for (const destPlan of plan.destinations) {
+        for (const [sourceUsername, seats] of Object.entries(destPlan.seatsBySource || {})) {
+          for (const seat of seats) sourceMap.set(seat, sourceUsername);
+        }
+      }
+
+      const reassignTargets = activeDestinations.map(d => {
+        const account = destAccountMap.get(d.username) || {};
+        const maxCount = Math.max(1, Math.min(parseInt(account.ticketCount, 10) || 30, 30));
+        const currentCount = d.assignedSeats.length;
+        return { username: d.username, ticketCount: Math.max(0, maxCount - currentCount) };
+      }).filter(d => d.ticketCount > 0);
+
+      if (reassignTargets.length > 0) {
+        const extraAssignments = assignSeatsToDestinations(failedSeats, reassignTargets);
+        for (const extra of extraAssignments) {
+          const dest = activeDestinations.find(d => d.username === extra.username);
+          if (dest && extra.assignedSeats.length) {
+            dest.assignedSeats = [...new Set([...dest.assignedSeats, ...extra.assignedSeats])];
+            // Rebuild seatsBySource for the newly added seats from their original sources.
+            for (const seat of extra.assignedSeats) {
+              const source = sourceMap.get(seat);
+              if (!source) continue;
+              if (!dest.seatsBySource[source]) dest.seatsBySource[source] = [];
+              if (!dest.seatsBySource[source].includes(seat)) dest.seatsBySource[source].push(seat);
+            }
+          }
+        }
+        emitStatus('transfer-rebalanced', `Re-distributed seats from failed destinations`, {
+          failed: failedDestinations.map(d => d.username),
+          reassignments: activeDestinations.map(d => ({ username: d.username, assignedSeats: d.assignedSeats })),
+        });
+      } else {
+        fileLog('WARN', `[transfer-multi] No ready destination can absorb failed-destination seats; keeping them on source masters`);
+        emitStatus('transfer-rebalance-none', `No ready destination can absorb failed-destination seats; keeping them on source masters`, { failedSeats });
+      }
+    }
+
+    // 5d. Ensure every source and ready destination has a full session snapshot
+    // for recovery / reuse if the active browser context is lost.
+    for (const src of sources) {
+      await backfillFullSession(src);
+    }
+    for (const dest of activeDestinations) {
+      await backfillFullSession(dest.session);
+    }
+
+    // 5c. Transfer seats sequentially through each ready destination.
+    const results = [];
+    let totalTransferred = 0;
+    let totalMissing = 0;
+
+    for (let destIdx = 0; destIdx < activeDestinations.length; destIdx++) {
+      const destPlan = activeDestinations[destIdx];
+      const toUsername = destPlan.username;
+      const assignedSeats = destPlan.assignedSeats;
+      const seatsBySource = destPlan.seatsBySource;
+      const destSession = destPlan.session;
+      const account = destAccountMap.get(toUsername) || { username: toUsername, useProxy: false };
+
+      fileLog('INFO', `[transfer-multi] [${destIdx + 1}/${activeDestinations.length}] Transferring to ${toUsername}: ${assignedSeats.length} seats`);
+
+      let transferredSeats = [];
+      let missingSeats = [];
+      for (const [sourceUsername, seatsForSource] of Object.entries(seatsBySource)) {
+        const sourceSession = activeSessions.get(sourceUsername);
+        if (!sourceSession) {
+          fileLog('WARN', `[transfer-multi] Source session ${sourceUsername} disappeared; marking ${seatsForSource.length} seats missing`);
+          missingSeats.push(...seatsForSource);
+          continue;
+        }
+        fileLog('INFO', `[transfer-multi] Transferring ${seatsForSource.length} seats from ${sourceUsername} to ${toUsername}: ${seatsForSource.join(', ')}`);
+        const transferResult = await transferSeatsToDestination(sourceSession, destSession, {
+          fixedSeats: seatsForSource,
+          mode,
+          batchSize,
+          maxBatchRetries,
+          sniperMode: true, // live-stream style: release from master as destination captures
+        });
+        fileLog('INFO', `[transfer-multi] Result to ${toUsername} from ${sourceUsername}: transferred=${(transferResult.transferredSeats || []).length}, missing=${(transferResult.missingSeats || []).length}`);
+        transferredSeats.push(...(transferResult.transferredSeats || []));
+        missingSeats.push(...(transferResult.missingSeats || []));
+      }
+
+      transferredSeats = [...new Set(transferredSeats)];
+      destSession.selectedSeats = transferredSeats;
+      reserveSeats(toUsername, transferredSeats);
+      emitAccountUpdate(toUsername, 'paused', { seats: transferredSeats });
+
+      totalTransferred += transferredSeats.length;
+      totalMissing += missingSeats.length;
+
+      fileLog('INFO', `[transfer-multi] Destination ${toUsername} final: transferred=${transferredSeats.length}, missing=${missingSeats.length}`);
+      results.push({
+        destination: toUsername,
+        transferred: transferredSeats.length,
+        failed: missingSeats.length,
+        seats: transferredSeats,
+        missing: missingSeats,
+        refilled: [],
+      });
+    }
+
+    // Add failed-destination entries to the result list.
+    for (const failed of failedDestinations) {
+      const rebalancedSeats = activeDestinations
+        .flatMap(d => d.assignedSeats || [])
+        .filter(s => failed.assignedSeats.includes(s));
+      const trulyLost = failed.assignedSeats.filter(s => !rebalancedSeats.includes(s));
+      totalMissing += trulyLost.length;
+      results.push({
+        destination: failed.username,
+        transferred: rebalancedSeats.length,
+        failed: trulyLost.length,
+        seats: rebalancedSeats,
+        missing: trulyLost,
+        refilled: [],
+        error: failed.error,
+      });
+    }
+
+    return {
+      success: true,
+      totalTransferred,
+      totalMissing,
+      details: results,
+    };
+  } finally {
+    clearTransferWhitelist();
+    for (const session of sources) {
+      transferLocks.delete(session.username);
+    }
+  }
+}
+
+// Transfer held seats from one or more source accounts to one or more destination accounts.
+// Backward compatible shapes:
+//   - Single: { fromUsername, toUsername, mode, batchSize, maxBatchRetries }
+//   - Legacy multi: { fromUsernames, toUsernames, mode, batchSize, url, targetSections, destinationAccounts }
+// New plan-based multi:
+//   { masterUsernames, destinations: [{ username, ticketCount }], mode, batchSize, maxBatchRetries, url, targetSections, distribution, sniperMode }
 app.post('/api/transfer-seats', async (req, res) => {
-  const { fromUsername, toUsername } = req.body;
-  if (!fromUsername || !toUsername) {
-    return res.status(400).json({ success: false, error: 'fromUsername and toUsername required' });
+  const { fromUsername, toUsername, fromUsernames, toUsernames, masterUsernames, destinations, mode, batchSize, maxBatchRetries, url, targetSections, destinationAccounts, distribution, sniperMode } = req.body;
+
+  // Backward compatibility: single source -> single destination.
+  if (typeof fromUsername === 'string' && typeof toUsername === 'string') {
+    try {
+      const result = await transferSeatsBetweenAccounts(fromUsername, toUsername, { mode, batchSize, maxBatchRetries });
+      res.json(result);
+    } catch (err) {
+      emitStatus('transfer-failed', `Transfer failed: ${err.message}`, { from: fromUsername, to: toUsername });
+      res.status(500).json({ success: false, error: err.message });
+    }
+    return;
+  }
+
+  // New plan-based multi-transfer.
+  if (Array.isArray(masterUsernames) && Array.isArray(destinations)) {
+    try {
+      const result = await transferSeatsMulti(masterUsernames, destinations.map(d => d.username), {
+        masterUsernames,
+        destinations,
+        mode,
+        batchSize,
+        maxBatchRetries,
+        url,
+        targetSections,
+        destinationAccounts,
+        distribution,
+        sniperMode,
+      });
+      res.json(result);
+    } catch (err) {
+      emitStatus('transfer-failed', `Plan transfer failed: ${err.message}`, { from: masterUsernames, to: destinations.map(d => d.username) });
+      res.status(500).json({ success: false, error: err.message });
+    }
+    return;
+  }
+
+  // Legacy multi-source / multi-destination transfer.
+  if (Array.isArray(fromUsernames) && Array.isArray(toUsernames)) {
+    try {
+      const result = await transferSeatsMulti(fromUsernames, toUsernames, { mode, batchSize, maxBatchRetries, url, targetSections, destinationAccounts });
+      res.json(result);
+    } catch (err) {
+      emitStatus('transfer-failed', `Multi-transfer failed: ${err.message}`, { from: fromUsernames, to: toUsernames });
+      res.status(500).json({ success: false, error: err.message });
+    }
+    return;
+  }
+
+  res.status(400).json({ success: false, error: 'fromUsername/toUsername, fromUsernames/toUsernames, or masterUsernames/destinations required' });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Session harvesting & Transfer Engine v3 endpoints
+// ═══════════════════════════════════════════════════════════════════
+
+app.post('/api/harvest-session', async (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ success: false, error: 'username required' });
+  const session = activeSessions.get(username);
+  if (!session || !session.page || !session.context) {
+    return res.status(404).json({ success: false, error: 'Account has no active session' });
   }
   try {
-    const result = await transferSeatsBetweenAccounts(fromUsername, toUsername);
-    res.json(result);
+    const fullSession = await harvestFullSession(session.page, session.context, username);
+    res.json({
+      success: true,
+      username,
+      cookiesCount: fullSession.cookies.length,
+      localStorageCount: Object.keys(fullSession.localStorage).length,
+      sessionStorageCount: Object.keys(fullSession.sessionStorage).length,
+      expiresAt: fullSession.expiresAt,
+    });
   } catch (err) {
-    emitStatus('transfer-failed', `Transfer failed: ${err.message}`, { from: fromUsername, to: toUsername });
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/list-sessions', async (req, res) => {
+  try {
+    const files = await fs.promises.readdir(SESSION_CACHE_DIR);
+    const sessions = [];
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const data = await fs.promises.readFile(path.join(SESSION_CACHE_DIR, file), 'utf8');
+        const session = JSON.parse(data);
+        sessions.push({
+          username: session.username,
+          timestamp: session.timestamp,
+          expiresAt: session.expiresAt,
+          cookiesCount: session.cookies?.length || 0,
+          localStorageCount: Object.keys(session.localStorage || {}).length,
+          sessionStorageCount: Object.keys(session.sessionStorage || {}).length,
+        });
+      } catch {}
+    }
+    res.json(sessions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/session/:username', async (req, res) => {
+  const { username } = req.params;
+  const filePath = sessionCacheFilePath(username);
+  try {
+    await fs.promises.unlink(filePath);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/transfer-seats-v3', async (req, res) => {
+  const { masterUsernames, destinations, url, targetSections } = req.body;
+  if (!Array.isArray(masterUsernames) || masterUsernames.length === 0) {
+    return res.status(400).json({ success: false, error: 'masterUsernames required' });
+  }
+  if (!Array.isArray(destinations) || destinations.length === 0) {
+    return res.status(400).json({ success: false, error: 'destinations required' });
+  }
+
+  const startTime = Date.now();
+  const destinationAccounts = Array.isArray(req.body.destinationAccounts) ? req.body.destinationAccounts : [];
+  const transferId = transferAuditor.record({
+    stage: 'v3-start',
+    sourceUser: masterUsernames.join(','),
+    seats: [],
+    metadata: {
+      destinationCount: destinations.length,
+      url,
+      targetSections,
+      destinationUsernames: destinations.map(d => d.username).join(','),
+    },
+  });
+
+  // 1. Validate source sessions.
+  const sourceSessions = [];
+  for (const username of masterUsernames) {
+    const session = activeSessions.get(username);
+    if (!session || !session.page || await isPageClosed(session.page)) {
+      const error = `Source ${username} has no active session`;
+      transferAuditor.record({ transferId, stage: 'v3-error', sourceUser: username, error, metadata: { reason: 'no-source-session' } });
+      return res.status(400).json({ success: false, error });
+    }
+    sourceSessions.push(session);
+  }
+
+  // 1b. Validate source hold tokens before attempting any transfer.
+  for (const src of sourceSessions) {
+    const tokenCheck = await validateHoldTokenViaSeatCloud(src.holdToken, src);
+    if (!tokenCheck.valid) {
+      const error = `Source ${src.username} hold token is not valid: ${tokenCheck.reason}`;
+      transferAuditor.record({ transferId, stage: 'v3-error', sourceUser: src.username, error, metadata: { reason: 'hold-token-invalid' } });
+      return res.status(400).json({ success: false, error });
+    }
+    fileLog('INFO', `[transfer-v3] ${src.username} hold token valid (ttl=${tokenCheck.ttl}, expiresAt=${tokenCheck.expiresAt})`);
+  }
+
+  // 2. Build initial transfer plan (verifies held seats and assigns to destinations).
+  let plan;
+  try {
+    plan = await buildTransferPlan(sourceSessions, destinations, { mode: 'auto', batchSize: 5, maxBatchRetries: 2 });
+  } catch (err) {
+    const error = err?.message || String(err);
+    transferAuditor.record({ transferId, stage: 'v3-error', error, metadata: { reason: 'plan-failed' } });
+    emitStatus('transfer-failed', `Transfer v3 plan failed: ${error}`, { error });
+    return res.status(500).json({ success: false, error });
+  }
+
+  // 2b. Pre-validate destination accounts before opening any browsers.
+  emitStatus('transfer-validating-destinations', `Pre-validating ${destinationAccounts.length} destination account(s)`, { count: destinationAccounts.length });
+  try {
+    const validationResults = await validateTransferDestinations(destinationAccounts, url, targetSections);
+    const invalidDestinations = validationResults.filter(r => !r.ready);
+    if (invalidDestinations.length === destinationAccounts.length && destinationAccounts.length > 0) {
+      const error = `All ${invalidDestinations.length} destination account(s) failed pre-validation`;
+      transferAuditor.record({ transferId, stage: 'v3-error', error, metadata: { invalidDestinations: invalidDestinations.map(d => ({ username: d.username, error: d.error })) } });
+      return res.status(400).json({ success: false, error, invalidDestinations });
+    }
+    if (invalidDestinations.length > 0) {
+      fileLog('WARN', `[transfer-v3] ${invalidDestinations.length} destination(s) failed pre-validation, will be skipped: ${invalidDestinations.map(d => d.username).join(', ')}`);
+    }
+  } catch (err) {
+    const error = `Destination pre-validation failed: ${err?.message || String(err)}`;
+    transferAuditor.record({ transferId, stage: 'v3-error', error, metadata: { reason: 'validation-exception' } });
+    fileLog('WARN', `[transfer-v3] ${error}`);
+  }
+
+  // 3. Prepare all destination sessions in parallel (bounded by maxConcurrency).
+  const destAccountMap = new Map();
+  for (const d of destinations) {
+    const acc = destinationAccounts.find(a => a.username === d.username) || d;
+    destAccountMap.set(d.username, acc);
+  }
+
+  const prepareResult = await prepareDestinationsInParallel(plan.destinations, destAccountMap, url, targetSections, {
+    prepareTimeoutMs: 45_000,
+    retryDelayMs: 2_000,
+    maxConcurrency: maxConcurrency || 3,
+  });
+
+  // 4. Redistribute seats from failed destinations to ready ones.
+  const readyDestinations = prepareResult.ready;
+  const failedPreparations = prepareResult.failed.map(f => ({ username: f.username, error: f.error }));
+
+  // Capture full-session snapshots for sources and ready destinations so recovery
+  // paths have the cookies/storage they need.
+  for (const src of sourceSessions) {
+    await backfillFullSession(src);
+  }
+  for (const dest of readyDestinations) {
+    await backfillFullSession(dest.session);
+  }
+
+  if (readyDestinations.length === 0) {
+    return res.json({
+      success: false,
+      totalTransferred: 0,
+      totalMissing: plan.destinations.reduce((s, d) => s + d.assignedSeats.length, 0),
+      failedPreparations,
+      details: [],
+      elapsedMs: Date.now() - startTime,
+    });
+  }
+
+  // Redistribute seats fairly among ready destinations.
+  const allSeats = plan.destinations.flatMap(d => d.assignedSeats);
+  const readyUsernames = readyDestinations.map(r => r.username);
+  const fairAssignments = assignSeatsToDestinations(allSeats, readyUsernames.map(u => ({ username: u, ticketCount: 0 })));
+  const seatAssignmentMap = new Map(fairAssignments.map(a => [a.username, a.assignedSeats]));
+
+  // 5. Execute transfers per source-destination batch.
+  const details = [];
+  let totalTransferred = 0;
+  let totalMissing = 0;
+
+  // Build reverse mapping: seat -> source session.
+  const sourceMap = new Map();
+  for (const src of sourceSessions) {
+    for (const seat of src.selectedSeats || []) sourceMap.set(seat, src);
+  }
+
+  for (const destPlan of readyDestinations) {
+    const destSession = destPlan.session;
+    const assignedSeats = seatAssignmentMap.get(destPlan.username) || [];
+    if (assignedSeats.length === 0) continue;
+
+    // Group seats by source so each source only releases its own seats.
+    const seatsBySource = new Map();
+    for (const seat of assignedSeats) {
+      const src = sourceMap.get(seat);
+      if (!src) continue;
+      if (!seatsBySource.has(src.username)) seatsBySource.set(src.username, { session: src, seats: [] });
+      seatsBySource.get(src.username).seats.push(seat);
+    }
+
+    emitStatus('destination-transferring', `Transferring ${assignedSeats.length} seat(s) to ${destPlan.username}`, { account: destPlan.username, seats: assignedSeats });
+    let destTransferred = [];
+    let destMissing = [];
+
+    for (const { session: srcSession, seats: batchSeats } of seatsBySource.values()) {
+      // Primary: live-stream atomic release/hold. The destination spams hold
+      // attempts while the source releases, shrinking the public-pool window.
+      let result = await liveStreamAtomicReleaseAndHold(srcSession, destSession, batchSeats);
+      let usedMode = 'livestream';
+
+      // Fallback 1: standard atomic release/hold for any missing seats.
+      if (result.missing.length > 0) {
+        const recovered = await holdSpecificSeatsViaWebSocket(srcSession.page, result.missing, srcSession.username, srcSession);
+        for (const s of recovered) {
+          if (!srcSession.selectedSeats.includes(s)) srcSession.selectedSeats.push(s);
+        }
+        result = await atomicReleaseAndHold(srcSession, destSession, result.missing);
+        usedMode = 'atomic-fallback';
+      }
+
+      // Fallback 2: legacy release/hold if atomic still left missing seats.
+      if (result.missing.length > 0) {
+        const recovered = await holdSpecificSeatsViaWebSocket(srcSession.page, result.missing, srcSession.username, srcSession);
+        for (const s of recovered) {
+          if (!srcSession.selectedSeats.includes(s)) srcSession.selectedSeats.push(s);
+        }
+        result = await legacyReleaseAndHold(srcSession, destSession, result.missing);
+        usedMode = 'legacy';
+      }
+
+      // Fallback 3: the full v2 transfer routine as a last resort.
+      if (result.missing.length > 0) {
+        const recovered = await holdSpecificSeatsViaWebSocket(srcSession.page, result.missing, srcSession.username, srcSession);
+        for (const s of recovered) {
+          if (!srcSession.selectedSeats.includes(s)) srcSession.selectedSeats.push(s);
+        }
+        const v2Result = await transferSeatsToDestination(srcSession, destSession, {
+          fixedSeats: result.missing,
+          mode: 'auto',
+          batchSize: 5,
+          maxBatchRetries: 2,
+        });
+        result = {
+          held: v2Result.transferredSeats || [],
+          missing: v2Result.missingSeats || [],
+        };
+        usedMode = 'v2-fallback';
+      }
+
+      // Make sure the source no longer tracks seats that were successfully moved.
+      for (const s of result.held) {
+        const key = String(s).trim().toUpperCase();
+        if (!srcSession.selectedSeats.includes(s)) srcSession.selectedSeats.push(s);
+        srcSession.selectedSeats = srcSession.selectedSeats.filter(x => String(x).trim().toUpperCase() !== key);
+        srcSession.releasedSeats.add(key);
+        releaseSeatFromPool(s);
+      }
+
+      destTransferred.push(...result.held);
+      destMissing.push(...result.missing);
+      emitStatus('transfer-batch-complete', `Batch to ${destPlan.username}: ${result.held.length}/${batchSeats.length} via ${usedMode}`, { account: destPlan.username, held: result.held, missing: result.missing, mode: usedMode });
+    }
+
+    totalTransferred += destTransferred.length;
+    totalMissing += destMissing.length;
+    details.push({
+      destination: destPlan.username,
+      transferred: destTransferred.length,
+      failed: destMissing.length,
+      seats: destTransferred,
+      missing: destMissing,
+    });
+    emitStatus('destination-complete', `Destination ${destPlan.username}: ${destTransferred.length} transferred, ${destMissing.length} missing`, { account: destPlan.username, transferred: destTransferred, missing: destMissing });
+
+    // Track the transferred seats on the destination session so the UI/keepalive
+    // treats them as held.
+    if (destSession) {
+      destSession.selectedSeats = destTransferred.slice();
+      reserveSeats(destPlan.username, destTransferred);
+    }
+  }
+
+  const elapsed = Date.now() - startTime;
+  const success = totalMissing === 0 && failedPreparations.length === 0;
+  emitStatus('transfer-done', `Transfer v3 complete: ${totalTransferred} transferred, ${totalMissing} missing`, { totalTransferred, totalMissing, elapsedMs: elapsed });
+
+  transferAuditor.record({
+    transferId,
+    stage: success ? 'v3-done' : 'v3-partial',
+    sourceUser: masterUsernames.join(','),
+    seats: details.flatMap(d => d.seats || []),
+    held: totalTransferred,
+    missing: totalMissing,
+    durationMs: elapsed,
+    metadata: { failedPreparations: failedPreparations.length, details },
+  });
+
+  res.json({
+    success,
+    totalTransferred,
+    totalMissing,
+    failedPreparations,
+    details,
+    elapsedMs: elapsed,
+  });
+});
+
+// ------------------------------------------------------------------
+// Headless WebSocket Transfer Engine endpoint
+// Body: {
+//   sourceUsername,
+//   destUsernames: [string],
+//   seats?: [string],
+//   url,                       // event URL or slug
+//   workspaceKey?, eventKey?,  // optional; resolved from url if missing
+//   channel?: 'NO_CHANNEL',
+// }
+// ------------------------------------------------------------------
+app.post('/api/transfer-seats-headless', async (req, res) => {
+  const { sourceUsername, destUsernames, seats, url, workspaceKey, eventKey, channel = 'NO_CHANNEL', accounts = [] } = req.body;
+  if (!sourceUsername || !Array.isArray(destUsernames) || destUsernames.length === 0) {
+    return res.status(400).json({ success: false, error: 'sourceUsername and destUsernames required' });
+  }
+  if (!url) return res.status(400).json({ success: false, error: 'url required' });
+
+  const slug = url.split('/').pop()?.split('?')[0] || url;
+
+  // ------------------------------------------------------------------
+  // Auto-prepare: ensure every account has an active browser session.
+  // If a session is missing, launch a browser, login, navigate to the event
+  // and harvest cookies/storage automatically.
+  // ------------------------------------------------------------------
+  async function autoPrepareAccount(username) {
+    let session = activeSessions.get(username);
+    if (session && session.page && !(await isPageClosed(session.page))) {
+      emitStatus('headless-prepared', `Using existing active session for ${username}`, { account: username });
+      return session;
+    }
+
+    const account = accounts.find(a => a.username === username);
+    if (!account) {
+      throw new Error(`No account data provided for ${username}`);
+    }
+
+    emitStatus('headless-preparing', `Auto-preparing ${username}: launching browser and logging in`, { account: username });
+
+    // Helper that builds the launch payload for a given proxy preference.
+    const buildLaunchAccount = (useProxy) => ({
+      ...account,
+      url,
+      targetSections: [],
+      ticketCount: 30,
+      useProxy,
+      assignedProxy: useProxy ? (account.assignedProxy || null) : null,
+    });
+
+    // First attempt: respect the account's proxy preference.
+    let lastError = null;
+    try {
+      session = await ensureSessionForTransfer(buildLaunchAccount(account.useProxy === true), { url, targetSections: [] });
+    } catch (firstErr) {
+      lastError = firstErr;
+      const errMsg = String(firstErr?.message || firstErr || 'unknown');
+      const isProxyFailure = /proxy|timeout|ip_collision|ip collision|PROXY_CONTEXT_FAILED|proxy-unhealthy/i.test(errMsg);
+      if (account.useProxy && isProxyFailure) {
+        emitStatus('headless-proxy-fallback', `Proxy failed for ${username}; retrying direct connection`, { account: username, error: errMsg });
+        fileLog('WARN', `[headless-prep] ${username} proxy attempt failed (${errMsg}); falling back to direct connection`);
+        try {
+          session = await ensureSessionForTransfer(buildLaunchAccount(false), { url, targetSections: [] });
+          lastError = null;
+        } catch (directErr) {
+          lastError = directErr;
+          fileLog('WARN', `[headless-prep] ${username} direct fallback also failed: ${directErr.message}`);
+        }
+      }
+    }
+
+    if (lastError) {
+      throw new Error(`Could not prepare session for ${username}: ${lastError.message}`);
+    }
+    if (!session || !session.page) {
+      throw new Error(`Could not prepare session for ${username}: no page returned`);
+    }
+
+    // Navigate to the event booking page and wait for the chart so cookies
+    // are fully scoped and a fresh hold token is available.
+    try {
+      await navigateToBookingPage(session.page, url, username);
+      await waitForChartAndStartImmediate(session.page, session, { timeoutMs: 25000 });
+    } catch (navErr) {
+      fileLog('WARN', `[headless-prep] ${username} chart wait warning: ${navErr.message}`);
+      // Defensive second navigation: if the page is still blank or not on /book, force a goto.
+      try {
+        const currentUrl = await session.page.url().catch(() => '');
+        if (!currentUrl.includes('/book')) {
+          const bookUrl = url.includes('/book') ? url : `${url.replace(/\/$/, '')}/book`;
+          emitStatus('headless-retry-navigate', `Retrying navigation to booking page for ${username}`, { account: username });
+          await session.page.goto(bookUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        }
+      } catch (retryErr) {
+        fileLog('WARN', `[headless-prep] ${username} retry navigation failed: ${retryErr.message}`);
+      }
+    }
+
+    // Harvest the full session and cache it.
+    try {
+      session.fullSession = await harvestFullSession(session.page, session.context, username);
+      emitStatus('headless-session-harvested', `Session harvested for ${username}`, { account: username });
+    } catch (harvestErr) {
+      fileLog('WARN', `[headless-prep] Could not harvest session for ${username}: ${harvestErr.message}`);
+    }
+
+    return session;
+  }
+
+  try {
+    await autoPrepareAccount(sourceUsername);
+    await Promise.all(destUsernames.map(u => autoPrepareAccount(u)));
+  } catch (prepErr) {
+    return res.status(500).json({ success: false, error: `Auto-preparation failed: ${prepErr.message}` });
+  }
+
+  const sourceSession = activeSessions.get(sourceUsername);
+  if (!sourceSession) {
+    return res.status(400).json({ success: false, error: `Source ${sourceUsername} has no active session after auto-prepare` });
+  }
+
+  // Resolve workspace/event keys from the active source session first.
+  let wsKey = workspaceKey || sourceSession.workspaceKey || null;
+  let evKey = eventKey || sourceSession.eventKey || null;
+
+  try {
+    if (!wsKey || !evKey) {
+      const keys = await fetchSeatcloudKeys(slug, null, null);
+      wsKey = wsKey || keys.workspaceKey;
+      evKey = evKey || keys.eventKey;
+    }
+    if (!wsKey || !evKey) {
+      return res.status(400).json({ success: false, error: 'Could not resolve workspaceKey/eventKey' });
+    }
+  } catch (err) {
+    return res.status(500).json({ success: false, error: `Key resolution failed: ${err.message}` });
+  }
+
+  // Determine seats to transfer.
+  let seatsToTransfer = Array.isArray(seats) && seats.length > 0
+    ? seats
+    : (sourceSession.selectedSeats || []).slice(0, 30);
+  if (!seatsToTransfer.length) {
+    return res.status(400).json({ success: false, error: 'No seats available for transfer' });
+  }
+
+  // Distribute seats per destination according to the account's transferTicketCount
+  // (default 5, max 30). Remainder stays on source.
+  const transfers = [];
+  let offset = 0;
+  for (const destUsername of destUsernames) {
+    const acc = accounts.find(a => a.username === destUsername);
+    const perDest = Math.max(1, Math.min(30, parseInt(acc?.transferTicketCount, 10) || 5));
+    const chunk = seatsToTransfer.slice(offset, offset + perDest);
+    if (!chunk.length) break;
+    transfers.push({ destUsername, seats: chunk });
+    offset += perDest;
+  }
+
+  // Build account payloads from active sessions or cached sessions.
+  async function buildAccount(username) {
+    const session = activeSessions.get(username);
+    const cached = await loadSessionFromCache(username);
+    const cookieMap = new Map();
+    if (session?.fullSession?.cookies) {
+      for (const c of session.fullSession.cookies) if (c?.name) cookieMap.set(c.name, c.value);
+    }
+    if (cached?.cookies) {
+      for (const c of cached.cookies) if (c?.name) cookieMap.set(c.name, c.value);
+    }
+    const rawCookies = cookieMap.size > 0 ? buildCookieHeaderFromMap(cookieMap) : '';
+    return {
+      username,
+      rawCookies,
+      structuredCookies: cookieMap.size > 0 ? [...cookieMap.entries()].map(([name, value]) => ({ name, value })) : null,
+      holdToken: session?.holdToken || getHoldTokenFromCookies(cookieMap) || null,
+      workspaceKey: wsKey,
+      eventKey: evKey,
+      channel,
+      proxyConfig: session?.proxy || null,
+    };
+  }
+
+  const sourceAccount = await buildAccount(sourceUsername);
+  const destAccounts = await Promise.all(transfers.map(t => buildAccount(t.destUsername)));
+
+  const startTime = Date.now();
+  const details = [];
+  let totalTransferred = 0;
+
+  for (let i = 0; i < transfers.length; i++) {
+    const { destUsername, seats } = transfers[i];
+    const destAccount = destAccounts[i];
+    emitStatus('headless-transfer-start', `Headless transfer of ${seats.length} seat(s) to ${destUsername}`, { destination: destUsername, seats });
+    try {
+      const result = await headlessTransferV3(sourceAccount, destAccount, seats, {
+        slug,
+        workspaceKey: wsKey,
+        eventKey: evKey,
+        channel,
+        onStatus: (stage, message) => emitStatus(`headless-${stage}`, message, { destination: destUsername }),
+      });
+      details.push({ destination: destUsername, ...result });
+      totalTransferred += result.held.length;
+      emitStatus('headless-transfer-result', `${destUsername}: ${result.held.length}/${seats.length} held`, { destination: destUsername, ...result });
+    } catch (err) {
+      details.push({ destination: destUsername, held: [], missing: seats, error: err.message });
+      emitStatus('headless-transfer-error', `Headless transfer to ${destUsername} failed: ${err.message}`, { destination: destUsername });
+    }
+  }
+
+  res.json({
+    success: details.every(d => (d.missing || []).length === 0),
+    totalTransferred,
+    totalMissing: details.reduce((s, d) => s + (d.missing || []).length, 0),
+    details,
+    elapsedMs: Date.now() - startTime,
+  });
+});
+
+function buildCookieHeaderFromMap(cookieMap) {
+  const parts = [];
+  for (const [name, value] of cookieMap) parts.push(`${name}=${value}`);
+  return parts.join('; ');
+}
+
+// Distribute held seats from a master account to multiple target accounts.
+// Body: { masterUsername, targets: [{ username, count }], mode, batchSize, maxBatchRetries }
+app.post('/api/distribute-seats', async (req, res) => {
+  const { masterUsername, targets, mode, batchSize, maxBatchRetries } = req.body;
+  if (!masterUsername || !Array.isArray(targets) || targets.length === 0) {
+    return res.status(400).json({ success: false, error: 'masterUsername and targets array required' });
+  }
+  const master = activeSessions.get(masterUsername);
+  if (!master) return res.status(400).json({ success: false, error: 'Master account has no active session' });
+
+  try {
+    const snapshot = await verifyHeldSeatsViaApi(master.page, master.holdToken, master.selectedSeats, { session: master });
+    if (!snapshot.length) throw new Error('Master account has no verified seats');
+
+    const totalRequested = targets.reduce((sum, t) => sum + (parseInt(t.count, 10) || 0), 0);
+    if (totalRequested > snapshot.length) {
+      throw new Error(`Requested ${totalRequested} seats but master only holds ${snapshot.length}`);
+    }
+
+    const results = [];
+    let offset = 0;
+    for (const target of targets) {
+      const count = parseInt(target.count, 10) || 0;
+      if (count <= 0) {
+        results.push({ username: target.username, count: 0, seats: [], missing: [] });
+        continue;
+      }
+      const subset = snapshot.slice(offset, offset + count);
+      offset += count;
+
+      const dest = activeSessions.get(target.username);
+      if (!dest) {
+        results.push({ username: target.username, count, seats: [], missing: subset, error: 'No active session' });
+        continue;
+      }
+
+      const transferResult = await transferSeatsBetweenAccounts(masterUsername, target.username, {
+        mode,
+        batchSize,
+        maxBatchRetries,
+        fixedSeats: subset,
+      });
+      results.push({
+        username: target.username,
+        count,
+        seats: transferResult.transferredSeats || [],
+        missing: transferResult.missingSeats || [],
+      });
+    }
+
+    res.json({ success: true, master: masterUsername, totalHeld: snapshot.length, distributed: results });
+  } catch (err) {
+    emitStatus('distribute-failed', `Distribution failed: ${err.message}`, { master: masterUsername });
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -4395,7 +7460,7 @@ async function processQueue() {
 // ------------------------------------------------------------------
 // Robust login / session validation
 // ------------------------------------------------------------------
-async function validateSessionViaAPI(page, username) {
+async function validateSessionViaAPI(page, username, session = null) {
   // Use Playwright's request context so stored cookies are sent automatically.
   try {
     const traceId = makeTraceId();
@@ -4408,11 +7473,13 @@ async function validateSessionViaAPI(page, username) {
     // Mimic the frontend api-Dkm25JAv.js Authorization header when a token cookie exists.
     if (authToken) headers.Authorization = `Bearer ${authToken}`;
 
-    const r = await page.request.fetch(`https://api.webook.com/api/v2/user/profile?lang=ar&trace_id=${traceId}`, {
+    const effectiveSession = session && session.context ? session : { context: page.context() };
+    const r = await sessionFetch(`https://api.webook.com/api/v2/user/profile?lang=ar&trace_id=${traceId}`, {
       method: 'GET',
       headers,
-    });
-    const status = r.status();
+      timeout: 4000,
+    }, effectiveSession);
+    const status = r.status;
     const text = await r.text();
     fileLog('INFO', `[${username}] Session API check: status=${status}`);
 
@@ -4538,8 +7605,9 @@ async function checkLoggedInAdvanced(page, username = '') {
   };
 }
 
-async function tryRefreshToken(page, username) {
+async function tryRefreshToken(page, username, session = null) {
   // Best-effort token refresh using the stored refresh_token cookie.
+  // If refresh fails, fall back to a full credential re-login when the password is known.
   try {
     const cookies = await page.context().cookies(['https://api.webook.com/', 'https://webook.com/']);
     const refreshCookie = cookies.find(c => c.name === 'refresh_token' && c.value);
@@ -4552,7 +7620,8 @@ async function tryRefreshToken(page, username) {
     emitStatus('login-refresh', 'Access token expired, attempting refresh...', { account: username });
 
     const traceId = makeTraceId();
-    const r = await page.request.fetch(`https://api.webook.com/api/v2/auth/refresh?lang=ar&trace_id=${traceId}`, {
+    const effectiveSession = session && session.context ? session : { context: page.context() };
+    const r = await sessionFetch(`https://api.webook.com/api/v2/auth/refresh?lang=ar&trace_id=${traceId}`, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -4560,17 +7629,40 @@ async function tryRefreshToken(page, username) {
         Origin: WB_ORIGIN,
         Referer: `${WB_ORIGIN}/`,
       },
-      data: JSON.stringify({ refresh_token: refreshCookie.value, lang: 'ar' }),
-    });
-    const status = r.status();
+      body: JSON.stringify({ refresh_token: refreshCookie.value, lang: 'ar' }),
+    }, effectiveSession);
+    const status = r.status;
     const text = await r.text();
     fileLog('INFO', `[${username}] Token refresh attempt: status=${status}`);
 
     if (status >= 200 && status < 300) {
       return { refreshed: true, source: 'auth-refresh' };
     }
+
+    // Refresh failed: try a full re-login if credentials are available.
+    if (session && session.password && !session.__skipLogin) {
+      try {
+        emitStatus('login-refresh', 'Refresh failed; attempting full re-login...', { account: username });
+        await ensureLoggedIn(page, username, session.password, session);
+        return { refreshed: true, source: 'relogin' };
+      } catch (loginErr) {
+        fileLog('WARN', `[${username}] Re-login after refresh failure also failed: ${loginErr.message}`);
+        return { refreshed: false, source: 'auth-refresh', status, error: `refresh failed; re-login failed: ${loginErr.message}` };
+      }
+    }
+
     return { refreshed: false, source: 'auth-refresh', status, error: text.slice(0, 500) };
   } catch (e) {
+    // On a network/timeout error, also attempt re-login if credentials are known.
+    if (session && session.password && !session.__skipLogin) {
+      try {
+        emitStatus('login-refresh', 'Refresh network error; attempting full re-login...', { account: username });
+        await ensureLoggedIn(page, username, session.password, session);
+        return { refreshed: true, source: 'relogin' };
+      } catch (loginErr) {
+        fileLog('WARN', `[${username}] Re-login after refresh network error also failed: ${loginErr.message}`);
+      }
+    }
     return { refreshed: false, source: 'auth-refresh', error: e.message };
   }
 }
@@ -4678,6 +7770,9 @@ async function performManualLogin(page, username, password, session) {
   ];
 
   for (let loginAttempt = 1; loginAttempt <= maxAttempts; loginAttempt++) {
+    if (session && (session.stopRequested || session.bookingPaused)) {
+      throw new Error('Login aborted by stop/pause request');
+    }
     emitStatus('login', `Manual login attempt ${loginAttempt}/${maxAttempts}`, { account: username });
 
     // 3-tier pre-check: accept API or strong UI auth signals before touching the DOM.
@@ -4701,20 +7796,20 @@ async function performManualLogin(page, username, password, session) {
 
     if (twoStep && emailIn && continueBtn) {
       // Two-step login: email first, then password after continue.
-      await emailIn.fill(username);
+      await emailIn.fill(username, { timeout: 2500 });
       emailFilled = true;
       try { await continueBtn.click({ force: true }); } catch { try { await continueBtn.evaluate(b => b.click()); } catch {} }
       // Wait for the password step with retries; some builds animate the transition.
-      // Keep the first pause short but long enough for the DOM to update.
-      await waitFor(150);
-      for (let passAttempt = 0; passAttempt < 10; passAttempt++) {
-        passIn = await waitForAnySelector(page, passSelectors, 400, true);
+      // Keep polling tight so the next step starts as soon as the DOM updates.
+      await waitFor(50);
+      for (let passAttempt = 0; passAttempt < 15; passAttempt++) {
+        passIn = await waitForAnySelector(page, passSelectors, 300, true);
         if (passIn) break;
         // If no password field, maybe the continue did not register; try pressing Enter.
         if (passAttempt === 2) {
           try { await emailIn.press('Enter'); } catch {}
         }
-        await waitFor(80);
+        await waitFor(20);
       }
       if (!passIn) {
         if (loginAttempt < maxAttempts) {
@@ -4732,30 +7827,37 @@ async function performManualLogin(page, username, password, session) {
         if (ui.loggedIn) return { success: true, source: `ui-post-attempt-${ui.source}`, reasons: ui.reasons };
         if (loginAttempt < maxAttempts) {
           emitStatus('login-retry', `Login button not visible, retry ${loginAttempt}/${maxAttempts}`, { account: username });
-          await waitFor(30);
+          // Force navigation to the dedicated login page so the DOM selectors
+          // always have a consistent target (fixes 401/timeout stalls).
+          try {
+            await page.goto('https://webook.com/ar/login', { waitUntil: 'domcontentloaded', timeout: 20000 });
+            await waitFor(100);
+          } catch (navErr) {
+            fileLog('WARN', `[${username}] Forced login navigation error: ${navErr.message}`);
+          }
           continue;
         }
         throw new Error('Login button not found');
       }
 
       try { await loginBtn.click({ force: true }); } catch { try { await loginBtn.evaluate(b => b.click()); } catch {} }
-      await waitFor(150);
+      await waitFor(50);
       const stepCheck = await waitForLoginFormOrLoggedIn(page, 1200);
       if (stepCheck.loggedIn) return { success: true, source: 'manual-login-modal-ui' };
       ({ emailIn, passIn, twoStep, continueBtn } = stepCheck);
 
       if (twoStep && emailIn && continueBtn) {
-        await emailIn.fill(username);
+        await emailIn.fill(username, { timeout: 2500 });
         emailFilled = true;
         try { await continueBtn.click({ force: true }); } catch { try { await continueBtn.evaluate(b => b.click()); } catch {} }
-        await waitFor(150);
-        for (let passAttempt = 0; passAttempt < 10; passAttempt++) {
-          passIn = await waitForAnySelector(page, passSelectors, 400, true);
+        await waitFor(50);
+        for (let passAttempt = 0; passAttempt < 15; passAttempt++) {
+          passIn = await waitForAnySelector(page, passSelectors, 300, true);
           if (passIn) break;
           if (passAttempt === 2) {
             try { await emailIn.press('Enter'); } catch {}
           }
-          await waitFor(80);
+          await waitFor(20);
         }
       }
     }
@@ -4763,14 +7865,20 @@ async function performManualLogin(page, username, password, session) {
     if (!emailIn || !passIn) {
       if (loginAttempt < maxAttempts) {
         emitStatus('login-retry', `Login form not visible, retry ${loginAttempt}/${maxAttempts}`, { account: username });
-        await waitFor(30);
+        // Force navigation to the dedicated login page on missing form too.
+        try {
+          await page.goto('https://webook.com/ar/login', { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await waitFor(100);
+        } catch (navErr) {
+          fileLog('WARN', `[${username}] Forced login navigation error: ${navErr.message}`);
+        }
         continue;
       }
       throw new Error('Login form not found');
     }
 
-    if (!emailFilled) await emailIn.fill(username);
-    await passIn.fill(password);
+    if (!emailFilled) await emailIn.fill(username, { timeout: 2500 });
+    await passIn.fill(password, { timeout: 2500 });
 
     const sub = await waitForAnySelector(page, submitSelectors, 800, true);
     const preSubmitUrl = page.url();
@@ -4782,7 +7890,7 @@ async function performManualLogin(page, username, password, session) {
 
     // Wait for the login to physically complete: navigation away from the login
     // page, the login modal/form disappearing, or a strong logged-in UI signal.
-    const completion = await waitForLoginCompletion(page, username, preSubmitUrl, 6000);
+    const completion = await waitForLoginCompletion(page, username, preSubmitUrl, 6000, session);
 
     const loginError = await page.evaluate(() => {
       const text = document.body ? (document.body.innerText || '') : '';
@@ -4825,10 +7933,13 @@ async function performManualLogin(page, username, password, session) {
  * 3. Authenticated UI appeared (profile, logout, my account).
  * 4. API profile endpoint returns valid user data.
  */
-async function waitForLoginCompletion(page, username, preSubmitUrl, timeoutMs = 6000) {
+async function waitForLoginCompletion(page, username, preSubmitUrl, timeoutMs = 6000, session = null) {
   const deadline = Date.now() + timeoutMs;
   let lastReason = 'timeout';
   while (Date.now() < deadline) {
+    if (session && (session.stopRequested || session.bookingPaused)) {
+      throw new Error('Login completion aborted by stop/pause request');
+    }
     const currentUrl = page.url();
     if (currentUrl !== preSubmitUrl && !currentUrl.includes('/login') && !currentUrl.includes('/auth')) {
       return { loggedIn: true, reason: 'navigation', url: currentUrl };
@@ -4882,6 +7993,7 @@ async function ensureLoggedIn(page, username, password, session) {
     const id = advanced.user ? (advanced.user.email || advanced.user.user_id) : (advanced.reasons.join(', ') || 'ui-signal');
     emitStatus('login', `Already logged in (source: ${advanced.source}, ${id})`, { account: username, source: advanced.source, reasons: advanced.reasons });
     await saveSessionState(username, session.context, { source: `ensureLoggedIn-${advanced.source}`, note: `reasons=${advanced.reasons.join('|')}` });
+    autoHarvestSession(page, session.context, username).catch(() => {});
     return true;
   }
 
@@ -4906,6 +8018,7 @@ async function ensureLoggedIn(page, username, password, session) {
   }
   await saveSessionState(username, session.context, { source: 'ensureLoggedIn-manual', note: result.source });
   emitStatus('login', 'Logged in successfully', { account: username, source: result.source });
+  autoHarvestSession(page, session.context, username).catch(() => {});
   return true;
 }
 
@@ -4923,27 +8036,38 @@ async function runSession(account, options = {}) {
 
   while (attempt <= maxAttempts) {
     // Use pre-assigned unique proxy if available; otherwise resolve dynamically.
+    // Cap proxy resolution so a bad proxy list cannot block the whole queue.
     let proxy = null;
     let tested = [];
     let proxyMode = currentProxyMode;
-    if (account.assignedProxy && account.assignedProxy.server) {
-      const test = await testProxy(account.assignedProxy, 6000);
-      tested.push({ server: account.assignedProxy.server, ok: test.ok, reason: test.reason });
-      if (test.ok) {
+    const proxyStartMs = Date.now();
+    fileLog('INFO', `[${username}] runSession proxy resolution start (attempt ${attempt}/${maxAttempts})`);
+
+    async function resolveProxyForRun() {
+      // Use pre-assigned proxy immediately; skip live testing so the browser opens fast.
+      if (account.assignedProxy && account.assignedProxy.server) {
         proxy = account.assignedProxy;
+        proxyMode = accountUseProxy === true ? 'forced' : (currentProxyMode === 'off' ? 'off' : currentProxyMode);
         logProxyStatus(username, 'PROXY ENABLED', proxy.server, 'pre-assigned');
-      } else if (currentProxyMode === 'required' || accountUseProxy === true) {
-        // If proxy is required globally OR the account explicitly forces a proxy,
-        // do not silently fall back to direct when the pre-assigned proxy fails.
-        fileLog('WARN', `[proxy-status] [${username}] Pre-assigned proxy failed (${account.assignedProxy.server}: ${test.reason}); searching for another working proxy`);
+        return;
+      }
+      if (!proxy) {
+        const resolved = await resolveProxyForAccount(username, accountUseProxy, proxyManager.getAll());
+        proxy = resolved.proxy;
+        tested = resolved.tested;
+        proxyMode = resolved.mode;
       }
     }
-    if (!proxy) {
-      const resolved = await resolveProxyForAccount(username, accountUseProxy);
-      proxy = resolved.proxy;
-      tested = resolved.tested;
-      proxyMode = resolved.mode;
+
+    try {
+      await withTimeout(resolveProxyForRun(), 20_000, `proxy resolution for ${username}`);
+    } catch (proxyTimeoutErr) {
+      fileLog('WARN', `[${username}] runSession proxy resolution timed out; using direct: ${proxyTimeoutErr.message}`);
+      emitStatus('proxy-fallback', `Proxy resolution timed out for ${username}; using direct connection`, { account: username });
+      proxy = null;
+      proxyMode = 'off';
     }
+    fileLog('INFO', `[${username}] runSession proxy resolution completed in ${Date.now() - proxyStartMs}ms -> ${proxy ? proxy.server : 'direct'}`);
 
     sessionCounter++;
     const sessionStartMs = Date.now();
@@ -4975,6 +8099,8 @@ async function runSession(account, options = {}) {
       selectedSeats: [],
       releasedSeats: new Set(),
       holdToken: accountType === 'holdToken' ? providedHoldToken : null,
+      holdTokenCreatedAt: accountType === 'holdToken' && providedHoldToken ? Date.now() : null,
+      holdTokenExpiresAt: accountType === 'holdToken' && providedHoldToken ? Date.now() + 15 * 60 * 1000 : null,
       holdInterval: null,
       proceedResolve: null,
       stopRequested: false,
@@ -4990,6 +8116,14 @@ async function runSession(account, options = {}) {
       selectedTeam: selectedTeam || null,
     };
     activeSessions.set(username, session);
+    // Reserve the assigned proxy so no concurrently launching account steals it.
+    if (proxy && proxy.server) {
+      if (!reserveProxyForSession(username, proxy)) {
+        const other = activeProxyReservations.get(getProxyCacheKey(proxy));
+        throw new Error(`PROXY_ALREADY_RESERVED: ${proxy.server} is already reserved by ${other || 'unknown'}`);
+      }
+    }
+    if (session.holdToken) registerHoldToken(username, session.holdToken);
     emitStatus('launching', `Launching mobile browser (attempt ${attempt}/${maxAttempts})...`, { account: username, attempt, maxAttempts });
     fileLog('INFO', `[${username}] Proxy assignment: ${proxy ? proxy.server : 'none'}, mode=${proxyMode}, tested=${JSON.stringify(tested.map(t => ({ server: t.server, ok: t.ok })))}`);
     if (proxy && proxy.server) {
@@ -5005,6 +8139,24 @@ async function runSession(account, options = {}) {
     session.__loadedSessionMeta = session.context.__kimikoSessionMeta || null;
     session.page = await session.context.newPage();
     const page = session.page;
+
+    // Verify egress IP and detect collisions with other active sessions.
+    try {
+      const publicIp = await getProxyIp(session);
+      if (publicIp) {
+        session.publicIp = publicIp;
+        const collision = [...activeSessions.entries()].some(([u, s]) => u !== username && s.publicIp === publicIp);
+        if (collision) {
+          if (currentProxyMode === 'required' || proxyMode === 'forced') {
+            throw new Error(`IP_COLLISION: ${username} shares IP ${publicIp} with another active session`);
+          }
+          fileLog('WARN', `[${username}] IP collision detected: ${publicIp}`);
+        }
+        fileLog('INFO', `[${username}] Context egress IP: ${publicIp}`);
+      }
+    } catch (ipErr) {
+      fileLog('WARN', `[${username}] Could not verify context egress IP: ${ipErr.message}`);
+    }
 
     // Credentials users: wipe any stale local storage, cookies, or session files
     // so the login sequence always starts from a clean slate. This prevents the
@@ -5035,6 +8187,8 @@ async function runSession(account, options = {}) {
         if (cookieHoldToken) {
           session.providedHoldToken = cookieHoldToken;
           session.holdToken = cookieHoldToken;
+          touchHoldToken(session, cookieHoldToken, 15);
+          registerHoldToken(username, session.holdToken);
           emitStatus('hold-token-from-cookies', 'Using hold token found in injected cookies', { account: username, tokenPrefix: cookieHoldToken.slice(0, 8) });
         }
       }
@@ -5056,6 +8210,35 @@ async function runSession(account, options = {}) {
       await page.evaluate((token) => {
         if (window.__kimikoSetHoldToken) window.__kimikoSetHoldToken(token);
       }, forcedToken).catch(() => {});
+    }
+    if (session.holdToken && isHoldTokenUsedByAnother(session.holdToken, username)) {
+      const other = activeHoldTokenRegistry.get(session.holdToken);
+      throw new Error(`DUPLICATE_HOLD_TOKEN: ${username} shares token with ${other}`);
+    }
+
+    // Credentials accounts: mint a fresh unique hold token so we never share a token with another account.
+    if (accountType === 'credentials' && !session.holdToken) {
+      try {
+        const fresh = await createFreshHoldToken(session, 30);
+        if (fresh?.holdToken) {
+          session.holdToken = fresh.holdToken;
+          touchHoldToken(session, fresh.holdToken, Math.ceil((fresh.expiresInSeconds || 1800) / 60), fresh.expiresAt);
+          registerHoldToken(username, fresh.holdToken);
+          await syncQueueTokenToCookie(session.context, null, fresh.holdToken);
+          await session.page.addInitScript(([token]) => {
+            if (window.__kimikoSetHoldToken) window.__kimikoSetHoldToken(token);
+            else {
+              window.__kimikoForcedHoldToken = token;
+              window.holdToken = token;
+              window.__INITIAL_STATE__ = window.__INITIAL_STATE__ || {};
+              window.__INITIAL_STATE__.hold_token = token;
+            }
+          }, [fresh.holdToken]);
+          fileLog('INFO', `[${username}] Fresh hold token minted via API: ${fresh.holdToken.slice(0, 12)}...`);
+        }
+      } catch (e) {
+        fileLog('WARN', `[${username}] Could not mint fresh hold token: ${e.message}`);
+      }
     }
 
     // Pre-set consent cookies and route interception in parallel before navigating.
@@ -5152,6 +8335,11 @@ async function runSession(account, options = {}) {
     //     authenticate there, then go directly to /book. Queue polling only
     //     happens when the DOM explicitly reports a waiting-room state.
     // ------------------------------------------------------------------
+
+    // Follower optimization: inject a previously harvested valid queue token
+    // before any navigation so this account skips the waiting room entirely.
+    await tryInjectHarvestedQueueToken(session);
+
     const isCookieFastTrack = accountType === 'holdToken';
 
     if (isCookieFastTrack) {
@@ -5200,6 +8388,17 @@ async function runSession(account, options = {}) {
 
     // Immediate page-state detection: chart/timer/login/404.
     let pageState = await detectBookingPageState(page);
+    // Double-check ambiguous queue signals with the accurate detector to avoid false positives.
+    if (pageState.state === 'queue') {
+      const accurate = await detectQueueStateAccurate(page, username);
+      if (!accurate.isInQueue) {
+        fileLog('INFO', `[${username}] Accurate queue detector overrode false queue signal; treating as ${accurate.hasChart || accurate.hasTimer ? 'booking-ready' : 'unknown'}`);
+        pageState.state = accurate.hasChart || accurate.hasTimer ? 'booking-ready' : 'unknown';
+        pageState.reason = 'accurate-detector-override';
+        pageState.hasChart = accurate.hasChart;
+        pageState.hasCountdown = accurate.hasTimer;
+      }
+    }
     fileLog('INFO', `[${username}] Initial page state: ${pageState.state} (${pageState.reason})`);
     emitStatus('page-state', `Page state: ${pageState.state}`, { account: username, ...pageState });
 
@@ -5257,20 +8456,50 @@ async function runSession(account, options = {}) {
     }
 
     // ------------------------------------------------------------------
-    // Queue handling: only poll the queue API if the DOM explicitly reports
-    // a waiting-room state. Booking hold timers / chart visibility are NOT
-    // queue signals and must bypass polling entirely.
+    // Proactive hold-token fetch: do NOT trust the DOM queue indicator. As
+    // soon as we are logged in, ask the API for a hold token. If the API
+    // gives one, bypass all waiting-room polling and start booking instantly.
     // ------------------------------------------------------------------
+    if (!session.holdToken && !session.queueHoldToken && !session.providedHoldToken) {
+      try {
+        const detail = await fetchEventDetail(eventSlug);
+        const eventId = detail?._id || detail?.data?._id || null;
+        if (eventId) {
+          const proactiveToken = await getHoldTokenFromApi(eventSlug, eventId, session);
+          if (proactiveToken) {
+            if (accountType === 'holdToken') {
+              session.holdToken = proactiveToken;
+            } else {
+              session.queueHoldToken = proactiveToken;
+            }
+            touchHoldToken(session, proactiveToken, 15);
+            emitStatus('proactive-hold-token', 'Hold token acquired before queue wait; bypassing queue', { account: username, tokenPrefix: proactiveToken.slice(0, 8) });
+          }
+        }
+      } catch (e) {
+        fileLog('WARN', `[${username}] Proactive hold token fetch failed: ${e.message}`);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Queue handling: only poll the queue API if the DOM explicitly reports
+    // a waiting-room state AND we could not acquire a proactive hold token.
+    // ------------------------------------------------------------------
+    const hasUsableHoldToken = !!(session.holdToken || session.queueHoldToken || session.providedHoldToken);
     if (isCookieFastTrack) {
       emitStatus('queue-bypassed', 'Cookie user with holdToken: skipping UI queue wait', { account: username });
-    } else if (pageState.state === 'queue') {
+    } else if (pageState.state === 'queue' && !hasUsableHoldToken) {
       // Follower optimization: if a previous credentials account already cleared
       // the queue and harvested a valid queue token, inject it before polling so
       // this account bypasses the waiting room instantly.
-      if (!session.queueToken && globalValidQueueToken) {
-        session.queueToken = globalValidQueueToken;
-        await syncQueueTokenToCookie(session.context, globalValidQueueToken);
-        emitStatus('queue-token-injected', 'Injected harvested queue token; attempting instant bypass', { account: username });
+      if (!session.queueToken && globalValidQueueToken && globalValidQueueToken.token) {
+        if (isQueueTokenValid(globalValidQueueToken.token)) {
+          session.queueToken = globalValidQueueToken.token;
+          await syncQueueTokenToCookie(session.context, globalValidQueueToken.token);
+          emitStatus('queue-token-injected', 'Injected harvested queue token; attempting instant bypass', { account: username });
+        } else {
+          globalValidQueueToken = null;
+        }
       }
 
       // Poll the /hold-token API aggressively. The instant it returns queued:false
@@ -5279,7 +8508,10 @@ async function runSession(account, options = {}) {
       if (cleared.cleared) {
         session.__queueCleared = true;
         if (cleared.holdToken) {
-          if (accountType === 'holdToken') session.holdToken = cleared.holdToken;
+          if (accountType === 'holdToken') {
+            session.holdToken = cleared.holdToken;
+            touchHoldToken(session, cleared.holdToken, 15);
+          }
           else session.queueHoldToken = cleared.holdToken;
         }
         await syncQueueTokenToCookie(session.context, cleared.queueToken, cleared.holdToken);
@@ -5291,7 +8523,10 @@ async function runSession(account, options = {}) {
             const eventId = detail?._id || detail?.data?._id || null;
             if (eventId) {
               const fallbackToken = await getHoldTokenFromApi(eventSlug, eventId, session);
-              if (fallbackToken) session.holdToken = fallbackToken;
+              if (fallbackToken) {
+                session.holdToken = fallbackToken;
+                touchHoldToken(session, fallbackToken, 15);
+              }
             }
           } catch (e) {
             fileLog('WARN', `[${username}] Could not fetch fallback hold token after queue clear: ${e.message}`);
@@ -5303,6 +8538,8 @@ async function runSession(account, options = {}) {
         await page.goto(queueClearedUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await dismissAllBanners(page, username, 'post-queue');
       }
+    } else if (hasUsableHoldToken) {
+      emitStatus('queue-bypassed', 'Hold token available; skipping queue wait', { account: username });
     } else if (pageState.state === 'booking-ready') {
       emitStatus('queue-bypassed', 'Already on booking page with chart/timer; skipping queue wait', { account: username });
     } else {
@@ -5399,12 +8636,6 @@ async function runSession(account, options = {}) {
             postLoginBookingReady = await isBookingPageReady(page);
           }
 
-          // Optional micro human-input movement (fast, non-blocking). The trigger
-          // watcher is the priority; this only runs while we wait for it.
-          try {
-            await humanInput.simulateMouseMovement(page, { points: 2, duration: 250 });
-          } catch {}
-
           return postLoginBookingReady;
         })();
 
@@ -5426,12 +8657,12 @@ async function runSession(account, options = {}) {
 
         // Turnstile check after trigger (fast, does not block the sniper long).
         emitStatus('turnstile-check', 'Checking for Cloudflare Turnstile overlay...', { account: username });
-        let turnstileCleared = await waitForTurnstileToClear(page, 15000, username);
+        let turnstileCleared = await waitForTurnstileToClear(page, 3000, username);
         if (!turnstileCleared) {
           fileLog('WARN', `[${username}] [turnstile] Turnstile still present; attempting 2captcha fallback`);
           const turnstileToken = await trySolveCaptchaWith2captcha(page, session, 'chart');
           if (turnstileToken) {
-            turnstileCleared = await waitForTurnstileToClear(page, 10000, username);
+            turnstileCleared = await waitForTurnstileToClear(page, 5000, username);
           }
         }
         if (turnstileCleared) {
@@ -5533,6 +8764,7 @@ async function runSession(account, options = {}) {
         }
         if (handoffToken) {
           session.holdToken = handoffToken;
+          touchHoldToken(session, handoffToken, HOLD_TOKEN_EXTENSION_MINUTES);
           const directHeld = await holdSpecificSeatsViaDirectWebSocket(
             session.workspaceKey,
             session.eventKey,
@@ -5569,6 +8801,7 @@ async function runSession(account, options = {}) {
         if (directHeld.length) {
           selectedSeats = directHeld;
           session.holdToken = directHoldToken;
+          touchHoldToken(session, directHoldToken, HOLD_TOKEN_EXTENSION_MINUTES);
           emitStatus('direct-ws-success', `Direct WS attack held ${selectedSeats.length}/${targetSeatCount} seats`, { account: username, seats: selectedSeats });
         }
       }
@@ -5617,6 +8850,7 @@ async function runSession(account, options = {}) {
           if (directHeld.length) {
             selectedSeats = [...new Set([...selectedSeats, ...directHeld])];
             session.holdToken = lastToken;
+            touchHoldToken(session, lastToken, 15);
             emitStatus('direct-ws-success', `Direct WS fallback held ${selectedSeats.length}/${targetSeatCount} seats`, { account: username, seats: selectedSeats });
           }
         }
@@ -5633,7 +8867,9 @@ async function runSession(account, options = {}) {
       fileLog('INFO', `[${username}] Provided hold token produced no seats; falling back to logged-in user's token`);
       forcedHoldTokenRegistry.delete(page);
       try {
-        session.holdToken = await readChartHoldToken(page, parseSlug(page.url()));
+        const chartToken = await readChartHoldToken(page, parseSlug(page.url()));
+        session.holdToken = chartToken;
+        if (chartToken) touchHoldToken(session, chartToken, 15);
       } catch (e) {
         fileLog('WARN', `[${username}] Could not read logged-in user's token: ${e.message}`);
       }
@@ -5657,6 +8893,13 @@ async function runSession(account, options = {}) {
         }
       } catch (syncErr) {
         fileLog('WARN', `[${username}] Final chart sync warning: ${syncErr.message}`);
+      }
+      // If the parent WeBook cart still shows fewer tickets than we hold,
+      // refresh the booking page with the hold token so the cart rehydrates.
+      try {
+        await refreshPageToSyncCart(session);
+      } catch (cartErr) {
+        fileLog('WARN', `[${username}] Cart refresh warning: ${cartErr.message}`);
       }
     }
 
@@ -5712,10 +8955,12 @@ async function runSession(account, options = {}) {
 
     // Pause until user clicks Proceed or Stop
     emitStatus('paused', 'Ready for payment. Waiting for Proceed signal...', { account: username, seats: selectedSeats });
-    await waitForProceedSignal(session);
+    const proceedSignal = await waitForProceedSignal(session);
 
-    if (session.stopRequested) {
-      throw new Error('Stopped by user before payment');
+    if (proceedSignal === 'stop' || session.stopRequested || session.bookingPaused) {
+      // Soft stop or hard stop: stay on the booking page, keep holds, do not click payment.
+      emitStatus('paused', 'Payment cancelled; staying on booking page with held seats', { account: username, seats: selectedSeats });
+      return;
     }
 
     // Proceed to payment
@@ -5833,6 +9078,539 @@ async function runSession(account, options = {}) {
 }
 
 /**
+ * Ensure a browser session exists for an account and is ready on the /book page
+ * with an interactive chart iframe. This is intended for external transfer flows
+ * that need a live, logged-in session without selecting or holding seats.
+ *
+ * Does NOT start keepalive, watcher, sniper, or any seat-selection logic.
+ */
+async function ensureSessionForTransfer(account, options = {}) {
+  const { username, password, url, targetSections, sectionQuota, ticketCount, accountIndex = 0, totalAccounts = 1, fixedSeats, type, holdToken: providedHoldToken, queueToken: providedQueueToken, cfClearance: providedCfClearance, recaptchaToken: providedRecaptchaToken, token: providedAuthToken, refreshToken: providedRefreshToken, rawCookies: providedRawCookies, structuredCookies: providedStructuredCookies, loginEmail, loginPassword, useProxy: accountUseProxy, workspaceKey: providedWorkspaceKey, eventKey: providedEventKey, selectedTeam } = account;
+  const accountType = type === 'holdToken' ? 'holdToken' : 'credentials';
+  const authUsername = accountType === 'holdToken' ? (loginEmail || username) : username;
+  const authPassword = accountType === 'holdToken' ? (loginPassword || password) : password;
+
+  // 1. Return existing active session if present.
+  const existing = activeSessions.get(username);
+  if (existing && existing.context && existing.page) {
+    return existing;
+  }
+
+  // Use pre-assigned unique proxy if available; otherwise resolve dynamically.
+  // For transfer destinations this must never block indefinitely: cap proxy
+  // resolution so the source hold token does not expire while we test proxies.
+  const sessionStartMs = Date.now();
+  let proxy = null;
+  let tested = [];
+  let proxyMode = currentProxyMode;
+  fileLog('INFO', `[${username}] Starting proxy resolution for transfer (useProxy=${accountUseProxy}, globalMode=${currentProxyMode})`);
+
+  async function resolveProxyWithTimeout() {
+    if (account.assignedProxy && account.assignedProxy.server) {
+      const test = await testProxy(account.assignedProxy, 2000);
+      tested.push({ server: account.assignedProxy.server, ok: test.ok, reason: test.reason });
+      if (test.ok) {
+        proxy = account.assignedProxy;
+        logProxyStatus(username, 'PROXY ENABLED', proxy.server, 'pre-assigned');
+        return;
+      } else if (currentProxyMode === 'required' || accountUseProxy === true) {
+        fileLog('WARN', `[proxy-status] [${username}] Pre-assigned proxy failed (${account.assignedProxy.server}: ${test.reason}); searching for another working proxy`);
+      }
+    }
+    if (!proxy) {
+      const resolved = await resolveProxyForAccount(username, accountUseProxy, null, {
+        maxTotalMs: 12_000,
+        perProxyTimeoutMs: 3_000,
+      });
+      proxy = resolved.proxy;
+      tested = resolved.tested;
+      proxyMode = resolved.mode;
+    }
+  }
+
+  try {
+    await withTimeout(resolveProxyWithTimeout(), 15_000, `proxy resolution for ${username}`);
+  } catch (proxyTimeoutErr) {
+    fileLog('WARN', `[${username}] Proxy resolution timed out; opening browser direct: ${proxyTimeoutErr.message}`);
+    emitStatus('proxy-fallback', `Proxy resolution timed out for ${username}; using direct connection`, { account: username });
+    proxy = null;
+    proxyMode = 'off';
+  }
+  fileLog('INFO', `[${username}] Proxy resolution completed in ${Date.now() - sessionStartMs}ms -> ${proxy ? proxy.server : 'direct'}`);
+
+  sessionCounter++;
+  const session = {
+    id: sessionCounter,
+    username,
+    password,
+    type: accountType,
+    providedHoldToken: accountType === 'holdToken' ? providedHoldToken : null,
+    providedQueueToken: accountType === 'holdToken' ? providedQueueToken : null,
+    providedCfClearance: accountType === 'holdToken' ? providedCfClearance : null,
+    providedRecaptchaToken: accountType === 'holdToken' ? providedRecaptchaToken : null,
+    providedAuthToken: accountType === 'holdToken' ? providedAuthToken : null,
+    providedRefreshToken: accountType === 'holdToken' ? providedRefreshToken : null,
+    providedRawCookies: accountType === 'holdToken' ? providedRawCookies : null,
+    providedStructuredCookies: accountType === 'holdToken' ? (Array.isArray(providedStructuredCookies) ? providedStructuredCookies : null) : null,
+    loginEmail: accountType === 'holdToken' ? loginEmail : null,
+    loginPassword: accountType === 'holdToken' ? loginPassword : null,
+    url,
+    targetSections,
+    sectionQuota: sectionQuota || null,
+    targetSeatCount: Math.max(1, Math.min(parseInt(ticketCount, 10) || 30, MAX_HELD_SEATS)),
+    accountIndex,
+    totalAccounts,
+    isSelecting: false,
+    context: null,
+    page: null,
+    state: 'launching',
+    selectedSeats: [],
+    releasedSeats: new Set(),
+    holdToken: accountType === 'holdToken' ? providedHoldToken : null,
+    holdTokenCreatedAt: accountType === 'holdToken' && providedHoldToken ? Date.now() : null,
+    holdTokenExpiresAt: accountType === 'holdToken' && providedHoldToken ? Date.now() + 15 * 60 * 1000 : null,
+    holdInterval: null,
+    proceedResolve: null,
+    stopRequested: false,
+    bookingPaused: false,
+    __skipLogin: accountType === 'holdToken',
+    speedSettings: { ...currentSpeedSettings },
+    proxy: proxy || null,
+    proxyMode,
+    proxyTested: tested,
+    workspaceKey: providedWorkspaceKey || null,
+    eventKey: providedEventKey || null,
+    chartSections: null,
+    selectedTeam: selectedTeam || null,
+  };
+  activeSessions.set(username, session);
+  if (proxy && proxy.server) {
+    if (!reserveProxyForSession(username, proxy)) {
+      const other = activeProxyReservations.get(getProxyCacheKey(proxy));
+      throw new Error(`PROXY_ALREADY_RESERVED: ${proxy.server} is already reserved by ${other || 'unknown'}`);
+    }
+  }
+  if (session.holdToken) registerHoldToken(username, session.holdToken);
+  emitStatus('launching', `Launching mobile browser for transfer session...`, { account: username });
+  fileLog('INFO', `[${username}] Transfer session proxy assignment: ${proxy ? proxy.server : 'none'}, mode=${proxyMode}, tested=${JSON.stringify(tested.map(t => ({ server: t.server, ok: t.ok })))}`);
+  if (proxy && proxy.server) {
+    logProxyStatus(username, 'PROXY ENABLED', proxy.server, proxyMode);
+  } else {
+    logProxyStatus(username, 'DIRECT (No Proxy)', null, proxyMode);
+  }
+  session.state = 'launching';
+  emitAccountUpdate(username, 'launching', { proxy: proxy ? proxy.server : null, proxyMode });
+
+  try {
+    fileLog('INFO', `[${username}] Creating mobile context for transfer...`);
+    session.context = await createMobileContext(username, 1, proxy);
+    fileLog('INFO', `[${username}] Mobile context created (${Date.now() - sessionStartMs}ms)`);
+    session.__loadedSessionMeta = session.context.__kimikoSessionMeta || null;
+    session.page = await session.context.newPage();
+    fileLog('INFO', `[${username}] New page created (${Date.now() - sessionStartMs}ms)`);
+
+    // Verify egress IP and detect collisions with other active sessions.
+    try {
+      const publicIp = await getProxyIp(session);
+      if (publicIp) {
+        session.publicIp = publicIp;
+        const collision = [...activeSessions.entries()].some(([u, s]) => u !== username && s.publicIp === publicIp);
+        if (collision) {
+          if (currentProxyMode === 'required' || proxyMode === 'forced') {
+            throw new Error(`IP_COLLISION: ${username} shares IP ${publicIp} with another active session`);
+          }
+          fileLog('WARN', `[${username}] IP collision detected: ${publicIp}`);
+        }
+        fileLog('INFO', `[${username}] Context egress IP: ${publicIp}`);
+      }
+    } catch (ipErr) {
+      fileLog('WARN', `[${username}] Could not verify context egress IP: ${ipErr.message}`);
+    }
+
+    const page = session.page;
+    installChartDetectionHook(page, session);
+
+    // Credentials users: wipe any stale local storage, cookies, or session files
+    // so the login sequence always starts from a clean slate.
+    if (accountType === 'credentials') {
+      await forceLogout(page, username);
+    }
+
+    // Compute exact event /book path for cookie scoping.
+    let exactPath = '/';
+    try {
+      const bookingUrlForCookies = url.includes('/book') ? url : `${url.replace(/\/$/, '')}/book`;
+      exactPath = new URL(bookingUrlForCookies).pathname;
+    } catch {}
+
+    // If the user pasted a full cookie string, inject it into the browser context now.
+    if (accountType === 'holdToken' && (session.providedRawCookies || session.providedStructuredCookies)) {
+      await injectRawCookies(session.context, session.providedRawCookies, exactPath, session.providedStructuredCookies);
+      session.__skipLogin = true;
+      emitStatus('cookies-injected', 'Injected copied cookies; skipping username/password login', { account: username });
+      if (!session.providedHoldToken) {
+        const cookieHoldToken = await getHoldTokenFromContext(session.context);
+        if (cookieHoldToken) {
+          session.providedHoldToken = cookieHoldToken;
+          session.holdToken = cookieHoldToken;
+          touchHoldToken(session, cookieHoldToken, 15);
+          registerHoldToken(username, session.holdToken);
+          emitStatus('hold-token-from-cookies', 'Using hold token found in injected cookies', { account: username, tokenPrefix: cookieHoldToken.slice(0, 8) });
+        }
+      }
+    }
+
+    // For holdToken accounts, force the provided token into the page before any
+    // navigation so the SeatCloud iframe reads it instead of the logged-in user's token.
+    if (accountType === 'holdToken' && session.providedHoldToken) {
+      const forcedToken = session.providedHoldToken;
+      await page.addInitScript(([token]) => {
+        if (window.__kimikoSetHoldToken) window.__kimikoSetHoldToken(token);
+        else {
+          window.__kimikoForcedHoldToken = token;
+          window.holdToken = token;
+          window.__INITIAL_STATE__ = window.__INITIAL_STATE__ || {};
+          window.__INITIAL_STATE__.hold_token = token;
+        }
+      }, [forcedToken]);
+      await page.evaluate((token) => {
+        if (window.__kimikoSetHoldToken) window.__kimikoSetHoldToken(token);
+      }, forcedToken).catch(() => {});
+    }
+    if (session.holdToken && isHoldTokenUsedByAnother(session.holdToken, username)) {
+      const other = activeHoldTokenRegistry.get(session.holdToken);
+      throw new Error(`DUPLICATE_HOLD_TOKEN: ${username} shares token with ${other}`);
+    }
+
+    // Credentials accounts: mint a fresh unique hold token so we never share a token with another account.
+    if (accountType === 'credentials' && !session.holdToken) {
+      try {
+        const fresh = await createFreshHoldToken(session, 30);
+        if (fresh?.holdToken) {
+          session.holdToken = fresh.holdToken;
+          touchHoldToken(session, fresh.holdToken, Math.ceil((fresh.expiresInSeconds || 1800) / 60), fresh.expiresAt);
+          registerHoldToken(username, fresh.holdToken);
+          await syncQueueTokenToCookie(session.context, null, fresh.holdToken);
+          await session.page.addInitScript(([token]) => {
+            if (window.__kimikoSetHoldToken) window.__kimikoSetHoldToken(token);
+            else {
+              window.__kimikoForcedHoldToken = token;
+              window.holdToken = token;
+              window.__INITIAL_STATE__ = window.__INITIAL_STATE__ || {};
+              window.__INITIAL_STATE__.hold_token = token;
+            }
+          }, [fresh.holdToken]);
+          fileLog('INFO', `[${username}] Fresh hold token minted via API (transfer session): ${fresh.holdToken.slice(0, 12)}...`);
+        }
+      } catch (e) {
+        fileLog('WARN', `[${username}] Could not mint fresh hold token for transfer: ${e.message}`);
+      }
+    }
+
+    // Pre-set consent cookies and route interception in parallel before navigating.
+    const cookiePresetPromise = preSetConsentCookies(session.context);
+    const routeSetupPromise = Promise.all([
+      setupWebSocketRoute(page),
+      setupChartIframePatchRoute(page),
+      setupBundlePatchRoute(page),
+      setupNoiseBlockRoute(page),
+    ]);
+
+    page.on('console', msg => {
+      const text = msg.text();
+      const type = msg.type();
+      fileLog('BROWSER', `[${username}] [console:${type}] ${text}`);
+      if (type === 'error' || text.includes('error') || text.includes('Error')) {
+        io.emit('console', { type: 'error', text, account: username });
+      }
+    });
+    page.on('pageerror', err => {
+      fileLog('BROWSER', `[${username}] [pageerror] ${err.message}`);
+    });
+    page.on('response', async res => {
+      const resUrl = res.url();
+      const status = res.status();
+      if (status >= 400 || resUrl.includes('seatcloud') || resUrl.includes('webook')) {
+        fileLog('NETWORK', `[${username}] [${status}] ${resUrl}`);
+      }
+      if (resUrl.includes('/api/v2/login') && status === 200) {
+        fileLog('INFO', `[${username}] Observed login API 200`);
+      }
+      const qt = res.headers()['queue-token'];
+      if (qt && !(accountType === 'holdToken' && session.providedQueueToken)) {
+        session.queueToken = qt;
+        fileLog('INFO', `[${username}] Queue token updated from ${resUrl}`);
+        syncQueueTokenToCookie(session.context, qt).catch(() => {});
+      }
+    });
+
+    await cookiePresetPromise;
+    await routeSetupPromise;
+
+    // For holdToken accounts, prevent WeBook's hold-token API from overwriting
+    // the provided token with a fresh one for the logged-in user.
+    setupHoldTokenProtectRoute(page, session);
+
+    const bookingUrl = url.includes('/book') ? url : `${url.replace(/\/$/, '')}/book`;
+    const eventSlug = parseSlug(bookingUrl);
+
+    // Pre-fetch chart keys BEFORE any queue/login/time-consuming UI work.
+    if (!session.workspaceKey || !session.eventKey) {
+      try {
+        const chartInfo = await fetchChartSections(eventSlug);
+        session.workspaceKey = chartInfo.workspaceKey;
+        session.eventKey = chartInfo.eventKey;
+        session.chartSections = chartInfo.chartSections;
+        session.teams = chartInfo.teams || [];
+        session.allTeamIds = chartInfo.allTeamIds || [];
+        session.commonChannelKeys = chartInfo.commonChannelKeys || [];
+        session.allChannelKeys = chartInfo.allChannelKeys || [];
+
+        if (selectedTeam?.id) {
+          if (selectedTeam.id === 'ALL_TEAMS') {
+            session.selectedTeam = { id: 'ALL_TEAMS', allChannelKeys: session.allChannelKeys, commonChannelKeys: session.commonChannelKeys };
+          } else {
+            const teamMeta = session.teams.find(t => String(t.id) === String(selectedTeam.id));
+            if (teamMeta) {
+              session.selectedTeam = {
+                id: selectedTeam.id,
+                name: teamMeta.name,
+                channelKeys: teamMeta.channelKeys || [],
+                commonChannelKeys: session.commonChannelKeys || [],
+              };
+            }
+          }
+        }
+        emitStatus('keys-prefetched', `Pre-fetched chart keys: ${session.workspaceKey}/${session.eventKey}`, { account: username });
+      } catch (e) {
+        fileLog('WARN', `[${username}] Could not pre-fetch chart sections: ${e.message}`);
+      }
+    }
+
+    // Follower optimization: inject a previously harvested valid queue token
+    // before any navigation so this account skips the waiting room entirely.
+    await tryInjectHarvestedQueueToken(session);
+
+    const isCookieFastTrack = accountType === 'holdToken';
+
+    if (isCookieFastTrack) {
+      emitStatus('navigating', 'Cookie user: navigating directly to booking page', { account: username });
+      session.state = 'navigating';
+      emitAccountUpdate(username, 'navigating');
+
+      await page.goto(bookingUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await emitScreenshot(page, 'booking-page-cookie', username);
+      await dismissAllBanners(page, username, 'pre-login');
+    } else {
+      emitStatus('navigating', 'Credentials user: navigating to dedicated login page', { account: username });
+      session.state = 'navigating';
+      emitAccountUpdate(username, 'navigating');
+
+      const loginUrl = 'https://webook.com/ar/login';
+      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await emitScreenshot(page, 'login-page', username);
+      await dismissAllBanners(page, username, 'login-page');
+
+      if (!session.__skipLogin) {
+        await ensureLoggedIn(page, authUsername, authPassword, session);
+        await dismissAllBanners(page, username, 'post-login');
+      } else {
+        emitStatus('login', 'Skipping manual login because cookies were injected', { account: username });
+      }
+
+      emitStatus('login', 'Login complete; saving session state and navigating to booking page', { account: username });
+      await waitFor(100);
+      await saveSessionState(authUsername, session.context, { source: 'ensureSessionForTransfer-login-page', note: 'cookies saved before navigating to /book' });
+
+      emitStatus('returning', 'Navigating to booking page', { account: username });
+      await page.goto(bookingUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
+
+    await dismissAllBanners(page, username, 'pre-login');
+
+    // Immediate page-state detection: chart/timer/login/404.
+    let pageState = await detectBookingPageState(page);
+    fileLog('INFO', `[${username}] Transfer session initial page state: ${pageState.state} (${pageState.reason})`);
+    emitStatus('page-state', `Page state: ${pageState.state}`, { account: username, ...pageState });
+
+    if (!isCookieFastTrack && pageState.state === 'login') {
+      throw new Error('SESSION_DROPPED_AFTER_BOOKING_NAVIGATION: still on login page after navigating to /book');
+    }
+
+    if (pageState.state === 'not-found') {
+      emitStatus('page-not-found', 'Booking page returned 404; falling back to event page', { account: username });
+      const baseEventUrl = bookingUrl.replace(/\/book$/, '');
+      await page.goto(baseEventUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await dismissAllBanners(page, username, 'post-404');
+      pageState = await detectBookingPageState(page);
+      fileLog('INFO', `[${username}] Transfer session page state after 404 fallback: ${pageState.state} (${pageState.reason})`);
+    }
+
+    if (pageState.state === 'login' && !session.__skipLogin) {
+      emitStatus('login-detected', 'Login page detected; logging in immediately', { account: username, loginAccount: authUsername });
+      const loginResult = await performManualLogin(page, authUsername, authPassword, session);
+      if (!loginResult.success) throw new Error('Login could not be completed after login-page detection');
+      await saveSessionState(authUsername, session.context, { source: 'ensureSessionForTransfer-login-page', note: loginResult.source });
+      emitStatus('login', 'Logged in successfully', { account: username, loginAccount: authUsername, source: loginResult.source });
+      if (!page.url().includes('/book')) {
+        await page.goto(bookingUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await dismissAllBanners(page, username, 'post-login-redirect');
+      }
+      pageState = await detectBookingPageState(page);
+    } else if (pageState.state === 'login' && session.__skipLogin) {
+      emitStatus('login-detected', 'Login page detected but cookies injected; skipping manual login', { account: username });
+    }
+
+    // Handle team selection before the chart is shown.
+    try {
+      if (await isTeamSelectionPage(page)) {
+        const handled = await handleTeamSelection(page, session, selectedTeam);
+        if (handled) {
+          for (let i = 0; i < 30; i++) {
+            await waitFor(100);
+            if (!(await isTeamSelectionPage(page))) break;
+          }
+          pageState = await detectBookingPageState(page);
+        }
+      }
+    } catch (teamErr) {
+      fileLog('WARN', `[${username}] Team selection handling error: ${teamErr.message}`);
+    }
+
+    // Queue handling: only poll the queue API if the DOM explicitly reports
+    // a waiting-room state. Double-check ambiguous signals so we do not block
+    // on a false queue detection when the page is actually booking-ready.
+    if (pageState.state === 'queue') {
+      const accurate = await detectQueueStateAccurate(page, username);
+      if (!accurate.isInQueue) {
+        fileLog('INFO', `[${username}] Transfer session: accurate detector overrode false queue signal; treating as ${accurate.hasChart || accurate.hasTimer ? 'booking-ready' : 'unknown'}`);
+        pageState.state = accurate.hasChart || accurate.hasTimer ? 'booking-ready' : 'unknown';
+      }
+    }
+
+    if (isCookieFastTrack) {
+      emitStatus('queue-bypassed', 'Cookie user with holdToken: skipping UI queue wait', { account: username });
+    } else if (pageState.state === 'queue') {
+      if (!session.queueToken && globalValidQueueToken && globalValidQueueToken.token) {
+        if (isQueueTokenValid(globalValidQueueToken.token)) {
+          session.queueToken = globalValidQueueToken.token;
+          await syncQueueTokenToCookie(session.context, globalValidQueueToken.token);
+          emitStatus('queue-token-injected', 'Injected harvested queue token; attempting instant bypass', { account: username });
+        } else {
+          globalValidQueueToken = null;
+        }
+      }
+
+      const cleared = await waitForQueueClear(page, username, session, eventSlug);
+      if (cleared.cleared) {
+        session.__queueCleared = true;
+        if (cleared.holdToken) {
+          if (accountType === 'holdToken') {
+            session.holdToken = cleared.holdToken;
+            touchHoldToken(session, cleared.holdToken, 15);
+          }
+          else session.queueHoldToken = cleared.holdToken;
+        }
+        await syncQueueTokenToCookie(session.context, cleared.queueToken, cleared.holdToken);
+        if (!session.holdToken && !session.queueHoldToken) {
+          try {
+            const detail = await fetchEventDetail(eventSlug);
+            const eventId = detail?._id || detail?.data?._id || null;
+            if (eventId) {
+              const fallbackToken = await getHoldTokenFromApi(eventSlug, eventId, session);
+              if (fallbackToken) {
+                session.holdToken = fallbackToken;
+                touchHoldToken(session, fallbackToken, 15);
+              }
+            }
+          } catch (e) {
+            fileLog('WARN', `[${username}] Could not fetch fallback hold token after queue clear: ${e.message}`);
+          }
+        }
+        const queueClearedUrl = (session.holdToken || session.queueHoldToken)
+          ? `${bookingUrl}${bookingUrl.includes('?') ? '&' : '?'}hold_token=${encodeURIComponent(session.holdToken || session.queueHoldToken)}`
+          : bookingUrl;
+        await page.goto(queueClearedUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await dismissAllBanners(page, username, 'post-queue');
+      }
+    } else if (pageState.state === 'booking-ready') {
+      emitStatus('queue-bypassed', 'Already on booking page with chart/timer; skipping queue wait', { account: username });
+    } else {
+      fileLog('INFO', `[${username}] Transfer session page state ${pageState.state}; not entering queue poll`);
+    }
+
+    fileLog('TIMER', `[${username}] ensureSessionForTransfer login/queue phase completed in ${Date.now() - sessionStartMs}ms`);
+
+    // Ensure we are on /book and the chart iframe is ready for transfers.
+    try {
+      await dismissAllBanners(page, username, 'post-login');
+      if (!page.url().includes('/book')) {
+        emitStatus('returning', 'Navigating back to booking page', { account: username });
+        await page.goto(bookingUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await dismissAllBanners(page, username, 'post-redirect');
+      }
+    } catch (uiErr) {
+      fileLog('WARN', `[${username}] Transfer session pre-booking redirect interaction failed (non-fatal): ${uiErr.message}`);
+      emitStatus('ui-warning', `Banner/redirect interaction skipped: ${uiErr.message}`, { account: username });
+    }
+
+    const activeHoldToken = session.holdToken || session.queueHoldToken || session.providedHoldToken || null;
+    if (activeHoldToken && session.workspaceKey && session.eventKey) {
+      if (accountType === 'holdToken' && session.providedHoldToken) {
+        await swapToProvidedHoldToken(page, session, bookingUrl);
+      }
+      emitStatus('transfer-session-ready', 'Hold token + chart keys available; session ready for transfer', { account: username, tokenPrefix: activeHoldToken.slice(0, 8) });
+    } else {
+      // UI-based readiness path: wait for the chart iframe to become interactive.
+      try {
+        await waitForSeatChartInteractive(page, 20000);
+      } catch (chartInteractiveErr) {
+        fileLog('WARN', `[${username}] ${chartInteractiveErr.message}`);
+      }
+    }
+
+    // Final verification: chart iframe must be present.
+    const finalFrame = await findChartFrame(page, username);
+    if (!finalFrame) {
+      throw new Error('TRANSFER_SESSION_CHART_NOT_READY: seat chart iframe not found after preparation');
+    }
+
+    fileLog('TIMER', `[${username}] ensureSessionForTransfer reached booking-ready in ${Date.now() - sessionStartMs}ms`);
+
+    // Harvest the full session (cookies + storageState + tokens) for later reuse
+    // by Transfer Engine v3. Keep this non-blocking and swallow errors.
+    try {
+      session.fullSession = await harvestFullSession(page, session.context, username);
+    } catch (harvestErr) {
+      fileLog('WARN', `[${username}] Session harvesting failed (non-fatal): ${harvestErr.message}`);
+    }
+
+    // Keep the transfer session alive like a normal booking session: watch the
+    // page timer and run hold keepalive so seats do not expire while waiting.
+    startPageTimerWatcher(session);
+    startHoldKeepalive(session);
+
+    session.state = 'paused';
+    emitAccountUpdate(username, 'paused', { url: page.url() });
+    emitStatus('paused', 'Transfer session ready. Waiting for transfer signal...', { account: username, url: page.url() });
+    return session;
+  } catch (err) {
+    const errMsg = String(err?.message || err || 'unknown');
+    emitStatus('error', `Transfer session preparation failed: ${errMsg}`, { account: username, error: errMsg });
+    fileLog('WARN', `[${username}] ensureSessionForTransfer failed: ${errMsg}`);
+    try {
+      await saveDiagnostics(session?.page, username, 'transfer-error-' + errMsg.replace(/[^a-z0-9]/gi, '_').slice(0, 50));
+    } catch {}
+    await safeScreenshot(session?.page, 'transfer-error', username);
+    try { await session.context?.close(); } catch {}
+    session.context = null;
+    session.page = null;
+    activeSessions.delete(username);
+    throw err;
+  }
+}
+
+/**
  * Launch a session in cycle-mode: it logs in, holds seats, and returns the
  * session object as soon as the seats are held. The browser context stays alive
  * so the pair manager can keep the hold alive or hand it off to a partner.
@@ -5861,9 +9639,18 @@ function runCycleSession(account) {
   });
 }
 
-async function waitForProceedSignal(session) {
+async function waitForProceedSignal(session, timeoutMs = 15 * 60 * 1000) {
   return new Promise(resolve => {
-    session.proceedResolve = resolve;
+    const timer = timeoutMs > 0 ? setTimeout(() => {
+      session.proceedResolve = null;
+      emitStatus('proceed-timeout', 'Proceed signal timed out; staying on booking page', { account: session.username });
+      resolve('stop');
+    }, timeoutMs) : null;
+    session.proceedResolve = (value) => {
+      session.proceedResolve = null;
+      if (timer) clearTimeout(timer);
+      resolve(value);
+    };
   });
 }
 
@@ -5904,6 +9691,8 @@ async function isChartReady(page) {
   }).catch(() => false);
 }
 
+const chartFrameEmitThrottle = new Map(); // username -> lastEmitMs
+
 async function findChartFrame(page, username, opts = {}) {
   if (!page || await isPageClosed(page)) return null;
 
@@ -5924,7 +9713,7 @@ async function findChartFrame(page, username, opts = {}) {
   for (const pattern of patterns) {
     const frame = page.frame({ url: pattern });
     if (frame && await isFrameUsable(frame)) {
-      if (opts.emit !== false) emitStatus('seats-frame-found', `Chart iframe found (${pattern})`, { account: username });
+      emitChartFrameFound(username, pattern, opts);
       return frame;
     }
   }
@@ -5940,13 +9729,22 @@ async function findChartFrame(page, username, opts = {}) {
         ((window.grecaptcha.enterprise && window.grecaptcha.enterprise.execute) || window.grecaptcha.execute)
       ));
       if (hasGrecaptcha) {
-        if (opts.emit !== false) emitStatus('seats-frame-found', 'Chart iframe found (has grecaptcha)', { account: username });
+        emitChartFrameFound(username, 'has grecaptcha', opts);
         return frame;
       }
     } catch {}
   }
 
   return null;
+}
+
+function emitChartFrameFound(username, detail, opts) {
+  if (opts && opts.emit === false) return;
+  const now = Date.now();
+  const last = chartFrameEmitThrottle.get(username) || 0;
+  if (now - last < 5_000) return; // throttle to once every 5 seconds per account
+  chartFrameEmitThrottle.set(username, now);
+  emitStatus('seats-frame-found', `Chart iframe found (${detail})`, { account: username });
 }
 
 async function isFrameUsable(frame) {
@@ -6108,6 +9906,7 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
   }
   if (session) {
     session.holdToken = holdToken;
+    touchHoldToken(session, holdToken, 15);
     // Prevent two credential sessions from sharing the same hold token, which
     // causes one session's holds to overwrite the other's.
     await ensureUniqueHoldToken(session);
@@ -6197,16 +9996,21 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
   }
 
   function addHeld(seats) {
+    const newlyHeld = [];
     for (const s of seats) {
       if (!heldSet.has(s)) {
         heldSet.add(s);
         bestEffortHeld.push(s);
+        newlyHeld.push(s);
         // Keep the shared session state in sync so the live WebSocket release
         // listener sees accurate slot counts while this sniper is still running.
         if (session && Array.isArray(session.selectedSeats) && !session.selectedSeats.includes(s)) {
           session.selectedSeats.push(s);
         }
       }
+    }
+    if (newlyHeld.length > 0) {
+      emitSeatEvent('seat-held', username, newlyHeld);
     }
   }
 
@@ -6221,36 +10025,45 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
     // and go straight to the sniper loop which uses exact labels.
     const safeSections = preferredSections.filter(s => !isSectionContested(s, username) && !isSectionBeingSelected(s, username));
     if (safeSections.length > 0) {
-      emitStatus('seats-fast', `Trying WS bestAvailable for ${wantedCount} seats in non-contested sections...`, { account: username, safeSections });
-      const allCategories = safeSections.map(sec => {
-        const meta = session?.chartSections?.find(s => s.label.toUpperCase() === sec.toUpperCase());
-        if (meta?.virtual && meta.categories?.length) return String(meta.categories[0].categoryKey);
-        return sec;
-      });
-      const fastHeld = await sendBestAvailableViaRoute(page, wantedCount, allCategories, 500, { token: holdToken, speedSettings: session?.speedSettings, session });
-      if (fastHeld.length > 0) {
-        const uniqueHeld = excludeReservedSeats(fastHeld, username);
-        const stolen = fastHeld.length - uniqueHeld.length;
-        if (stolen > 0) {
-          emitStatus('seats-reserved-conflict', `${stolen} seat(s) already reserved by another account, skipping`, { account: username, seats: fastHeld.filter(s => isSeatReserved(s, username)) });
+      const fastLocks = [];
+      for (const sec of safeSections) {
+        const releaseLock = await acquireSectionHoldLock(sec);
+        fastLocks.push(releaseLock);
+      }
+      try {
+        emitStatus('seats-fast', `Trying WS bestAvailable for ${wantedCount} seats in non-contested sections...`, { account: username, safeSections });
+        const allCategories = safeSections.map(sec => {
+          const meta = session?.chartSections?.find(s => s.label.toUpperCase() === sec.toUpperCase());
+          if (meta?.virtual && meta.categories?.length) return String(meta.categories[0].categoryKey);
+          return sec;
+        });
+        const fastHeld = await sendBestAvailableViaRoute(page, wantedCount, allCategories, 450, { token: holdToken, speedSettings: session?.speedSettings, session });
+        if (fastHeld.length > 0) {
+          const uniqueHeld = excludeReservedSeats(fastHeld, username);
+          const stolen = fastHeld.length - uniqueHeld.length;
+          if (stolen > 0) {
+            emitStatus('seats-reserved-conflict', `${stolen} seat(s) already reserved by another account, skipping`, { account: username, seats: fastHeld.filter(s => isSeatReserved(s, username)) });
+          }
+          if (uniqueHeld.length > 0) {
+            reserveSeats(username, uniqueHeld);
+            addHeld(uniqueHeld);
+          }
+          // Filter out any seats the user explicitly released earlier.
+          if (releasedSet.size > 0) {
+            bestEffortHeld = excludeReleasedSeats(bestEffortHeld, releasedSet);
+            heldSet.clear();
+            bestEffortHeld.forEach(s => heldSet.add(s));
+          }
+          // Only stop here if the fast path already satisfied the per-user target.
+          // Partial results must continue into the sniper loop so we reach the
+          // requested ticket count instead of exiting early.
+          if (bestEffortHeld.length >= wantedCount) {
+            emitStatus('seats-grabbed', `WS bestAvailable reached target ${bestEffortHeld.length}/${wantedCount} seats in ${Date.now() - holdStartTime}ms`, { account: username, seats: bestEffortHeld });
+            return await syncAndReturn(bestEffortHeld, 'fast-bestAvailable');
+          }
         }
-        if (uniqueHeld.length > 0) {
-          reserveSeats(username, uniqueHeld);
-          addHeld(uniqueHeld);
-        }
-        // Filter out any seats the user explicitly released earlier.
-        if (releasedSet.size > 0) {
-          bestEffortHeld = excludeReleasedSeats(bestEffortHeld, releasedSet);
-          heldSet.clear();
-          bestEffortHeld.forEach(s => heldSet.add(s));
-        }
-        // Only stop here if the fast path already satisfied the per-user target.
-        // Partial results must continue into the sniper loop so we reach the
-        // requested ticket count instead of exiting early.
-        if (bestEffortHeld.length >= wantedCount) {
-          emitStatus('seats-grabbed', `WS bestAvailable reached target ${bestEffortHeld.length}/${wantedCount} seats in ${Date.now() - holdStartTime}ms`, { account: username, seats: bestEffortHeld });
-          return await syncAndReturn(bestEffortHeld, 'fast-bestAvailable');
-        }
+      } finally {
+        for (const release of fastLocks) release();
       }
     } else {
       emitStatus('seats-fast-skip', `Skipping global bestAvailable; all preferred sections are contested by other accounts`, { account: username, preferredSections });
@@ -6274,7 +10087,7 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
   const emptyGiveUpMs = 120_000;
   let lastItems = [];
 
-  while (bestEffortHeld.length < wantedCount && !(session && (session.stopRequested || session.bookingPaused))) {
+  while (bestEffortHeld.length < wantedCount && !(session && (session.stopRequested || session.bookingPaused || session.isTransferring))) {
     if (Date.now() - sniperStart > sniperAbsoluteMaxMs) break;
     if (bestEffortHeld.length === 0 && Date.now() - sniperStart > emptyGiveUpMs) break;
     const stillNeed = wantedCount - bestEffortHeld.length;
@@ -6289,12 +10102,12 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
       lastItems = items;
     } catch (e) {
       fileLog('WARN', `[${username}] Seat map fetch failed: ${e.message}`);
-      await waitFor(150);
+      await waitFor(100);
       continue;
     }
 
     if (items.length === 0) {
-      await waitFor(400);
+      await waitFor(250);
       continue;
     }
 
@@ -6352,30 +10165,35 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
         const availableInSection = availability[sectionNorm] || 0;
         const contested = isSectionContested(sectionNorm, username) || isSectionBeingSelected(sectionNorm, username);
         if (availableInSection > 0 && !contested) {
-          // For virtual sections use the seats.io category key; otherwise use the section label.
-          const originalMeta = session?.chartSections?.find(s => s.label.toUpperCase() === (originalLabel || sectionLabel).toUpperCase());
-          const bestAvailableCategory = (originalMeta?.virtual && originalMeta.categories?.length)
-            ? String(originalMeta.categories[0].categoryKey)
-            : String(sectionLabel);
-          emitStatus('seats-sniping', `Sniping ${sectionNeed} seat(s) in ${sectionLabel} via bestAvailable...`, { account: username });
-          anyAttemptThisScan = true;
-          const held = await sendBestAvailableViaRoute(page, sectionNeed, [bestAvailableCategory], 800, { token: holdToken, speedSettings: session?.speedSettings, session });
-          if (held.length > 0) {
-            // If another account in the same run already reserved some of these seats,
-            // drop the overlapping ones and keep sniping. This prevents two accounts
-            // from fighting over the same bestAvailable result.
-            const uniqueHeld = excludeReservedSeats(held, username);
-            const stolen = held.length - uniqueHeld.length;
-            if (stolen > 0) {
-              emitStatus('seats-reserved-conflict', `${stolen} seat(s) already reserved by another account, skipping`, { account: username, seats: held.filter(s => isSeatReserved(s, username)) });
+          const releaseLock = await acquireSectionHoldLock(sectionNorm);
+          try {
+            // For virtual sections use the seats.io category key; otherwise use the section label.
+            const originalMeta = session?.chartSections?.find(s => s.label.toUpperCase() === (originalLabel || sectionLabel).toUpperCase());
+            const bestAvailableCategory = (originalMeta?.virtual && originalMeta.categories?.length)
+              ? String(originalMeta.categories[0].categoryKey)
+              : String(sectionLabel);
+            emitStatus('seats-sniping', `Sniping ${sectionNeed} seat(s) in ${sectionLabel} via bestAvailable...`, { account: username });
+            anyAttemptThisScan = true;
+            const held = await sendBestAvailableViaRoute(page, sectionNeed, [bestAvailableCategory], 600, { token: holdToken, speedSettings: session?.speedSettings, session });
+            if (held.length > 0) {
+              // If another account in the same run already reserved some of these seats,
+              // drop the overlapping ones and keep sniping. This prevents two accounts
+              // from fighting over the same bestAvailable result.
+              const uniqueHeld = excludeReservedSeats(held, username);
+              const stolen = held.length - uniqueHeld.length;
+              if (stolen > 0) {
+                emitStatus('seats-reserved-conflict', `${stolen} seat(s) already reserved by another account, skipping`, { account: username, seats: held.filter(s => isSeatReserved(s, username)) });
+              }
+              if (uniqueHeld.length > 0) {
+                reserveSeats(username, uniqueHeld);
+                addHeld(uniqueHeld);
+                emitStatus('seats-grabbed', `Sniped ${uniqueHeld.length} seat(s) in ${sectionLabel}`, { account: username, seats: uniqueHeld });
+              }
+              if (bestEffortHeld.length >= wantedCount) break;
+              continue;
             }
-            if (uniqueHeld.length > 0) {
-              reserveSeats(username, uniqueHeld);
-              addHeld(uniqueHeld);
-              emitStatus('seats-grabbed', `Sniped ${uniqueHeld.length} seat(s) in ${sectionLabel}`, { account: username, seats: uniqueHeld });
-            }
-            if (bestEffortHeld.length >= wantedCount) break;
-            continue;
+          } finally {
+            releaseLock();
           }
         } else if (contested) {
           emitStatus('seats-sniping-skip', `Skipping bestAvailable in ${sectionLabel}; section is contested by another account`, { account: username, section: sectionLabel });
@@ -6436,35 +10254,40 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
       // does not pick the same candidates in the same millisecond.
       reserveSeats(username, seatsToHold);
 
-      anyAttemptThisScan = true;
-      emitStatus('seats-holding', `Sending ${seatsToHold.length} individual hold frames in ${sectionLabel} (fast burst)...`, { account: username });
-      let held = await sendHoldViaRoute(page, seatsToHold, { fastMode: true, timeoutMs: speed.sniperTimeoutMs, gapMs: speed.sniperBurstGapMs, username, token: holdToken, speedSettings: session?.speedSettings, session });
+      const releaseLock = await acquireSectionHoldLock(sectionLabel);
+      try {
+        anyAttemptThisScan = true;
+        emitStatus('seats-holding', `Sending ${seatsToHold.length} individual hold frames in ${sectionLabel} (fast burst)...`, { account: username });
+        let held = await sendHoldViaRoute(page, seatsToHold, { fastMode: true, timeoutMs: speed.sniperTimeoutMs, gapMs: speed.sniperBurstGapMs, username, token: holdToken, speedSettings: session?.speedSettings, session });
 
-      // Release reservations for seats that did not actually get held.
-      const heldSetResult = new Set(held.map(String));
-      for (const s of seatsToHold) {
-        if (!heldSetResult.has(String(s))) releaseSeatFromPool(s);
-      }
-      fileLog('INFO', `[${username}] Fast burst WS hold result: ${held.length}/${seatsToHold.length} held in ${sectionLabel}`);
+        // Release reservations for seats that did not actually get held.
+        const heldSetResult = new Set(held.map(String));
+        for (const s of seatsToHold) {
+          if (!heldSetResult.has(String(s))) releaseSeatFromPool(s);
+        }
+        fileLog('INFO', `[${username}] Fast burst WS hold result: ${held.length}/${seatsToHold.length} held in ${sectionLabel}`);
 
-      if (held.length === 0 && frame) {
-        emitStatus('seats-frame-fallback', `WS hold empty; trying chart.selectObjects in ${sectionLabel}`, { account: username });
-        const frameRes = await sendHoldViaFrame(frame, seatsToHold, forcedToken ? { token: forcedToken, page, username } : { page, username });
-        if (frameRes.ok && frameRes.sent.length > 0) {
-          const ht = forcedToken || holdToken || await readChartHoldToken(page, pageSlug);
-          if (ht) {
-            const verified = await verifyHeldSeatsViaApi(page, ht, seatsToHold, { session });
-            held = verified.length > 0 ? verified : frameRes.sent;
-          } else {
-            held = frameRes.sent;
+        if (held.length === 0 && frame) {
+          emitStatus('seats-frame-fallback', `WS hold empty; trying chart.selectObjects in ${sectionLabel}`, { account: username });
+          const frameRes = await sendHoldViaFrame(frame, seatsToHold, forcedToken ? { token: forcedToken, page, username } : { page, username });
+          if (frameRes.ok && frameRes.sent.length > 0) {
+            const ht = forcedToken || holdToken || await readChartHoldToken(page, pageSlug);
+            if (ht) {
+              const verified = await verifyHeldSeatsViaApi(page, ht, seatsToHold, { session });
+              held = verified.length > 0 ? verified : frameRes.sent;
+            } else {
+              held = frameRes.sent;
+            }
           }
         }
-      }
 
-      addHeld(held);
+        addHeld(held);
 
-      if (held.length > 0) {
-        emitStatus('seats-grabbed', `Held ${held.length} seat(s) in ${sectionLabel}`, { account: username, seats: held });
+        if (held.length > 0) {
+          emitStatus('seats-grabbed', `Held ${held.length} seat(s) in ${sectionLabel}`, { account: username, seats: held });
+        }
+      } finally {
+        releaseLock();
       }
 
       if (bestEffortHeld.length >= wantedCount) break;
@@ -6481,9 +10304,9 @@ async function selectSeatsViaWebSocket(page, targetSections, targetCount, userna
     });
     if (releaseRelevant) {
       emitStatus('ws-seat-released', `Released seats detected via WebSocket; re-scanning immediately`, { account: username, seats: recentReleases });
-      await waitFor(25);
+      await waitFor(15);
     } else {
-      await waitFor(anyAttemptThisScan ? 150 : 400);
+      await waitFor(anyAttemptThisScan ? 100 : 250);
     }
   }
 
@@ -6546,12 +10369,14 @@ async function holdSpecificSeatsViaWebSocket(page, seatLabels, username, session
         const verified = await verifyHeldSeatsViaApi(page, ht, wanted, { session });
         if (verified.length > 0) {
           if (session) session.selectedSeats = verified;
+          emitSeatEvent('seat-held', username, verified, { source: 'holdSpecificSeatsViaWebSocket-frame-verified' });
           fileLog('TIMER', `[${username}] holdSpecificSeatsViaWebSocket (frame fallback) completed in ${Date.now() - handoffStart}ms -> ${verified.length}/${wanted.length}`);
           await syncChartSelection(frame, verified, { page, username });
           return verified;
         }
       }
       if (session) session.selectedSeats = frameRes.sent;
+      emitSeatEvent('seat-held', username, frameRes.sent, { source: 'holdSpecificSeatsViaWebSocket-frame-sent' });
       fileLog('TIMER', `[${username}] holdSpecificSeatsViaWebSocket (frame sent) completed in ${Date.now() - handoffStart}ms -> ${frameRes.sent.length}/${wanted.length}`);
       await syncChartSelection(frame, frameRes.sent, { page, username });
       return frameRes.sent;
@@ -6560,6 +10385,7 @@ async function holdSpecificSeatsViaWebSocket(page, seatLabels, username, session
 
   if (held.length > 0) {
     if (session) session.selectedSeats = held;
+    emitSeatEvent('seat-held', username, held, { source: 'holdSpecificSeatsViaWebSocket' });
     if (frame) {
       try {
         const syncRes = await syncChartSelection(frame, held, { page, username });
@@ -6676,8 +10502,9 @@ function buildCandidateGroups(items, sectionLabel, targetCount) {
 
 async function patchChartLimits(frame, repeatMs = 500, durationMs = 10000, page = null, username = '') {
   const start = Date.now();
+  const LIMIT_VALUE = 150;
   const script = () => {
-    const set100 = (obj, keys, value = 100) => {
+    const setLimit = (obj, keys, value = LIMIT_VALUE) => {
       if (!obj || typeof obj !== 'object') return;
       for (const key of keys) {
         if (key in obj) {
@@ -6694,24 +10521,41 @@ async function patchChartLimits(frame, repeatMs = 500, durationMs = 10000, page 
         }
       }
     };
+    const patchChartMethods = (chart) => {
+      if (!chart || chart.__kimikoRuntimePatched) return;
+      chart.__kimikoRuntimePatched = true;
+      const methods = ['selectObjects','selectObject','deselectObjects','deselectObject','render','redraw','draw','rerender'];
+      for (const method of methods) {
+        if (typeof chart[method] !== 'function' || chart[method].__kimikoPatched) continue;
+        const orig = chart[method];
+        chart[method] = function (...args) {
+          setLimit(chart.state);
+          setLimit(chart.config);
+          setLimit(chart.options);
+          return orig.apply(this, args);
+        };
+        chart[method].__kimikoPatched = true;
+      }
+    };
     const keys = ['maxNumberOfHolds','maxSelectedObjects','maxNumberOfSelectedObjects','maxObjects','maxSeats','selectionLimit','holdLimit','maxHold','maxSelection','maxPerOrder','max_per_order','maxTickets','maxTicketCount','ticketLimit','purchaseLimit','event_order_limit','season_order_limit','order_limit'];
-    set100(window.chartState, keys);
-    set100(window.currentChartConfig, keys);
-    set100(window.seatsioConfig, keys);
-    set100(window.seatsio?.config, keys);
+    setLimit(window.chartState, keys);
+    setLimit(window.currentChartConfig, keys);
+    setLimit(window.seatsioConfig, keys);
+    setLimit(window.seatsio?.config, keys);
     const targets = [window.chartRender, window.chart, window.SeatsChart, (window.seatsio && window.seatsio.chart)];
     for (const chart of targets) {
       if (!chart) continue;
-      set100(chart.state, keys);
-      set100(chart.config, keys);
-      set100(chart._config, keys);
-      set100(chart.options, keys);
+      setLimit(chart.state, keys);
+      setLimit(chart.config, keys);
+      setLimit(chart._config, keys);
+      setLimit(chart.options, keys);
       if (chart.state) {
         if (!Array.isArray(chart.state.selectedObjects)) chart.state.selectedObjects = [];
         if (typeof chart.state._selectionCount === 'number') chart.state._selectionCount = 0;
         if (typeof chart.state._holdCount === 'number') chart.state._holdCount = 0;
         if (typeof chart.state.heldCount === 'number') chart.state.heldCount = 0;
       }
+      patchChartMethods(chart);
     }
     // Hook the constructor if it exists and is not already patched.
     if (typeof window.__kimikoChartLimitPatch === 'object' && typeof window.__kimikoChartLimitPatch.hookConstructor === 'function') {
@@ -6908,6 +10752,25 @@ async function sendHoldViaFrame(frame, seats, wsParams = {}) {
     } catch {}
 
     const sent = [];
+    // Prefer the bulk prompt-aware API; fall back to one-by-one if unavailable.
+    if (typeof chart.trySelectObjects === 'function') {
+      try {
+        await chart.trySelectObjects(seats);
+        // Use listSelectedObjects when available for authoritative confirmation.
+        if (typeof chart.listSelectedObjects === 'function') {
+          const selected = await chart.listSelectedObjects();
+          for (const obj of selected) {
+            const label = obj?.label || obj?.objectId || obj?.id;
+            if (label) sent.push(String(label));
+          }
+        } else {
+          sent.push(...seats);
+        }
+        return { ok: true, sent };
+      } catch (e) {
+        fileLog('WARN', `trySelectObjects bulk failed: ${e.message}; falling back to one-by-one`);
+      }
+    }
     for (const label of seats) {
       try {
         chart.selectObjects([label]);
@@ -7247,6 +11110,33 @@ async function syncChartSelection(frame, seats, opts = {}) {
       forceRedraw();
     } catch {}
 
+    // 5) Notify the parent WeBook page so its cart/summary refreshes. The Seats.io
+    // React wrapper normally invokes onObjectSelected callbacks for user clicks;
+    // when we hold via raw WebSocket we must replay those callbacks manually.
+    try {
+      const seatObjects = seats.map(label => ({
+        label,
+        objectId: label,
+        id: label,
+        selected: true,
+        status: 'reservedByToken',
+        heldByCurrentToken: true,
+      }));
+      if (chart) {
+        for (const cbName of ['onObjectSelected', 'onObjectsSelected', 'objectSelected', 'objectsSelected']) {
+          const cb = chart.config?.[cbName] || chart[cbName];
+          if (typeof cb === 'function') {
+            cb(seatObjects.length === 1 ? seatObjects[0] : seatObjects);
+            break;
+          }
+        }
+      }
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: 'objectsSelected', objects: seatObjects }, '*');
+        window.parent.postMessage({ event: 'objectsSelected', objects: seatObjects }, '*');
+      }
+    } catch {}
+
     selected = getSelectedLabels();
     return { ok: selected.length > 0 || seats.length > 0, selectedCount: selected.length, requested: seats.length, selected };
   }, { seats, timeoutMs, start });
@@ -7397,39 +11287,70 @@ function getProxyAgent(proxyConfig) {
   return new HttpsProxyAgent(proxyUrl);
 }
 
-function openSeatcloudWebSocket(url, timeoutMs = 8000, proxyConfig = null) {
-  return new Promise((resolve, reject) => {
-    const wsOptions = {
-      perMessageDeflate: false,
-      handshakeTimeout: timeoutMs,
-      headers: {
-        Origin: WB_ORIGIN,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-    };
-
-    // Route the native WS connection through the session proxy. Playwright does
-    // NOT proxy ws connections opened from Node; we must do it explicitly.
-    if (proxyConfig && proxyConfig.server) {
-      let agent;
-      try {
-        agent = getProxyAgent(proxyConfig);
-      } catch (agentErr) {
-        return reject(new Error(`Proxy agent creation failed: ${agentErr.message}`));
-      }
-      if (agent) {
-        wsOptions.agent = agent;
-        fileLog('INFO', `[proxy-status] [direct-ws] Routing WebSocket through proxy ${proxyConfig.server}`);
+async function resolveWebSocketProxy(proxyConfig) {
+  // Resolve the proxy that should be used for a raw WebSocket connection.
+  // Returns { agent, proxyServer } or throws a descriptive error.
+  let effectiveProxy = proxyConfig;
+  if (effectiveProxy && effectiveProxy.server) {
+    let agent;
+    try {
+      agent = getProxyAgent(effectiveProxy);
+    } catch (agentErr) {
+      fileLog('WARN', `[proxy-status] [direct-ws] Proxy agent creation failed for ${effectiveProxy.server}: ${agentErr.message}; trying fallback`);
+      const fallback = await getWorkingProxyForAccount('direct-ws', proxyManager.getAll().filter(p => p.server !== effectiveProxy.server));
+      if (fallback.proxy) {
+        effectiveProxy = fallback.proxy;
+        try {
+          agent = getProxyAgent(effectiveProxy);
+          fileLog('INFO', `[proxy-status] [direct-ws] Using fallback proxy: ${effectiveProxy.server}`);
+        } catch (fallbackErr) {
+          throw new Error(`PROXY_FALLBACK_FAILED: ${fallbackErr.message}`);
+        }
       } else {
-        // If a proxy was explicitly supplied, do not silently bypass it.
-        return reject(new Error('PROXY_REQUIRED_BUT_INVALID_DIRECT_WS'));
+        throw new Error(`PROXY_AGENT_CREATION_FAILED: ${agentErr.message}`);
       }
-    } else if (currentProxyMode === 'required') {
-      return reject(new Error('PROXY_REQUIRED_BUT_NO_PROXY_DIRECT_WS'));
-    } else {
-      fileLog('INFO', '[proxy-status] [direct-ws] Routing WebSocket direct (no proxy)');
     }
+    if (agent) {
+      fileLog('INFO', `[proxy-status] [direct-ws] Routing WebSocket through proxy ${effectiveProxy.server}`);
+      return { agent, proxyServer: effectiveProxy.server };
+    }
+    // If a proxy was explicitly supplied, do not silently bypass it.
+    throw new Error('PROXY_REQUIRED_BUT_INVALID_DIRECT_WS');
+  }
 
+  if (currentProxyMode === 'required') {
+    const fallback = await getWorkingProxyForAccount('direct-ws');
+    if (fallback.proxy) {
+      try {
+        const agent = getProxyAgent(fallback.proxy);
+        fileLog('INFO', `[proxy-status] [direct-ws] Using fallback proxy for required mode: ${fallback.proxy.server}`);
+        return { agent, proxyServer: fallback.proxy.server };
+      } catch (e) {
+        throw new Error(`PROXY_REQUIRED_BUT_NO_WORKING_PROXY: ${e.message}`);
+      }
+    }
+    throw new Error('PROXY_REQUIRED_BUT_NO_PROXY_DIRECT_WS');
+  }
+
+  fileLog('INFO', '[proxy-status] [direct-ws] Routing WebSocket direct (no proxy)');
+  return { agent: null, proxyServer: null };
+}
+
+async function openSeatcloudWebSocket(url, timeoutMs = 8000, proxyConfig = null) {
+  const wsOptions = {
+    perMessageDeflate: false,
+    handshakeTimeout: timeoutMs,
+    headers: {
+      Origin: WB_ORIGIN,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    },
+  };
+
+  // Resolve proxy outside the Promise executor to avoid the async-executor anti-pattern.
+  const { agent } = await resolveWebSocketProxy(proxyConfig);
+  if (agent) wsOptions.agent = agent;
+
+  return new Promise((resolve, reject) => {
     const ws = new WebSocket(url, wsOptions);
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
@@ -7657,7 +11578,7 @@ async function executeDirectWebSocketSniper(session, page, holdToken, targetSect
 
   emitStatus('direct-ws-attack', `Launching direct WebSocket attack for ${targetCount} seat(s)`, { account: username, target: targetCount });
 
-  while (Date.now() - directStart < directMaxMs && held.length < targetCount && !session.bookingPaused && !session.stopRequested) {
+  while (Date.now() - directStart < directMaxMs && held.length < targetCount && !session.bookingPaused && !session.stopRequested && !session.isTransferring) {
     const stillNeed = targetCount - held.length;
     const batch = await holdSeatsViaDirectWebSocket(
       session.workspaceKey,
@@ -7898,16 +11819,22 @@ function setupHoldTokenProtectRoute(page, session) {
 }
 
 function patchSeatcloudBundle(js) {
-  // The SeatCloud/Seats.io bundle has a gatekeeper function (Qn in the
-  // current build) that decides whether a seat can be added to the current
-  // selection. It checks maxSelectedObjects / maxNumberOfHolds and returns
-  // false when the limit is reached. Replacing its body with `return !0`
-  // removes the frontend cap so the chart will accept (and render) 30+ holds.
+  // The SeatCloud/Seats.io bundle has a gatekeeper function that decides whether
+  // a seat can be added to the current selection. It checks maxSelectedObjects /
+  // maxNumberOfHolds and returns false when the limit is reached. Replacing its
+  // body with `return !0` removes the frontend cap so the chart will accept and
+  // render 30+ holds.
+  let patchedFn = false;
+
+  // Try known signatures first (Qn and similar obfuscated names).
   const signatures = [
     'function Qn(e,t,{ticketType:n,categoryKey:i,label:o},a)',
     'function Qn(e,t,{ticketType:n,categoryKey:i,label:o},a){',
+    'function Kn(e,t,{ticketType:n,categoryKey:i,label:o},a)',
+    'function Kn(e,t,{ticketType:n,categoryKey:i,label:o},a){',
+    'function $n(e,t,{ticketType:n,categoryKey:i,label:o},a)',
+    'function $n(e,t,{ticketType:n,categoryKey:i,label:o},a){',
   ];
-  let patchedFn = false;
   for (const sig of signatures) {
     const idx = js.indexOf(sig);
     if (idx === -1) continue;
@@ -7921,22 +11848,24 @@ function patchSeatcloudBundle(js) {
       close++;
     }
     if (depth === 0) {
-      // close points one character past the closing '}', so include it.
       js = js.slice(0, open + 1) + 'return !0;' + js.slice(close - 1);
       patchedFn = true;
       break;
     }
   }
 
-  // Fallback / extra hardening: neutralise any standalone expression that
-  // returns a computed limit by forcing it to a large constant. This catches
-  // helper functions or renamed builds without relying only on the Qn name.
+  // Generic gatekeeper detection: functions whose body references the limit keys
+  // and returns a boolean decision. We match a few common shapes.
   if (!patchedFn) {
-    // Pattern: function Xn(e,t,n,i){ ... return c.total+r<=t ... }
-    // We match the common "c.total+r>... ? return false : return true" shape.
-    const genericRe = /function\s+[a-zA-Z$][a-zA-Z0-9$]*\(e,t,n,i\)\s*\{[^}]*(?:c\.total\s*\+\s*r\s*>|maxNumberOfHolds|maxSelectedObjects)[^}]*\}/;
-    const match = js.match(genericRe);
-    if (match) {
+    const genericPatterns = [
+      // function Xn(e,t,n,i){ ... c.total+r>t ... return ... }
+      /function\s+[a-zA-Z$][a-zA-Z0-9$]*\([a-zA-Z$,]+\)\s*\{[^}]*(?:c\.total\s*\+\s*r\s*[<>]=?\s*t|maxNumberOfHolds|maxSelectedObjects|maxObjects)[^}]*\}/,
+      // function Xn(e,t,n){ ... e>t ... }
+      /function\s+[a-zA-Z$][a-zA-Z0-9$]*\([a-zA-Z$,]+\)\s*\{[^}]*(?:maxNumberOfHolds|maxSelectedObjects|maxObjects)[^}]*return\s*(?:!0|!1|true|false)[^}]*\}/,
+    ];
+    for (const genericRe of genericPatterns) {
+      const match = js.match(genericRe);
+      if (!match) continue;
       const sig = match[0];
       const idx = js.indexOf(sig);
       const open = js.indexOf('{', idx);
@@ -7949,17 +11878,21 @@ function patchSeatcloudBundle(js) {
       if (depth === 0) {
         js = js.slice(0, open + 1) + 'return !0;' + js.slice(close - 1);
         patchedFn = true;
+        break;
       }
     }
   }
 
-  // Also rewrite literal initialisations of the 5-seat cap so even code paths
-  // that read the default config see a high limit. Be careful not to break
-  // unrelated numbers.
+  // Rewrite literal initialisations of the 5-seat (and 4/6/8/10) cap so even code
+  // paths that read the default config see a high limit.
   const limitLiterals = [
-    { re: /maxNumberOfHolds\s*:\s*5\b/g, to: 'maxNumberOfHolds:100' },
-    { re: /maxSelectedObjects\s*:\s*5\b/g, to: 'maxSelectedObjects:100' },
-    { re: /maxSelectedObjects\s*:\s*\[\s*\{[^\]]*quantity\s*:\s*5\b[^\]]*\}\s*\]/g, to: 'maxSelectedObjects:[{category:"",quantity:100,total:100}]' },
+    { re: /maxNumberOfHolds\s*:\s*\d+\b/g, to: 'maxNumberOfHolds:150' },
+    { re: /maxSelectedObjects\s*:\s*\d+\b/g, to: 'maxSelectedObjects:150' },
+    { re: /maxSelectedObjects\s*:\s*\[\s*\{[^\]]*quantity\s*:\s*\d+\b[^\]]*\}\s*\]/g, to: 'maxSelectedObjects:[{category:"",quantity:150,total:150}]' },
+    { re: /maxNumberOfSelectedObjects\s*:\s*\d+\b/g, to: 'maxNumberOfSelectedObjects:150' },
+    { re: /maxObjects\s*:\s*\d+\b/g, to: 'maxObjects:150' },
+    { re: /selectionLimit\s*:\s*\d+\b/g, to: 'selectionLimit:150' },
+    { re: /holdLimit\s*:\s*\d+\b/g, to: 'holdLimit:150' },
   ];
   for (const { re, to } of limitLiterals) {
     const before = js;
@@ -8128,8 +12061,34 @@ function setupWebSocketRoute(page) {
         state.closed = true;
         state.ready = false;
         state.connecting = false;
+        if (state.silenceTimer) {
+          clearInterval(state.silenceTimer);
+          state.silenceTimer = null;
+        }
         emitStatus('ws-route-closed', 'SeatCloud WebSocket route closed');
       });
+
+      // Detect silent server-side disconnects. If no message arrives for 90s,
+      // force a reconnect by closing the server side; Playwright will re-invoke
+      // the route handler when the client reconnects.
+      if (state.silenceTimer) clearInterval(state.silenceTimer);
+      state.silenceTimer = setInterval(() => {
+        if (state.closed || !state.server) {
+          clearInterval(state.silenceTimer);
+          state.silenceTimer = null;
+          return;
+        }
+        const silence = Date.now() - state.lastMessageAt;
+        if (silence > 90000) {
+          fileLog('WARN', `SeatCloud WS route silent for ${silence}ms; forcing reconnect`);
+          try { state.server.close(); } catch {}
+          state.closed = true;
+          state.ready = false;
+          state.server = null;
+          clearInterval(state.silenceTimer);
+          state.silenceTimer = null;
+        }
+      }, 30000);
     } catch (e) {
       emitStatus('ws-route-error', `WebSocket route setup failed: ${e.message}`);
     }
@@ -8162,6 +12121,10 @@ function resetWebSocketRouteState(page) {
       try { state.server.close(); } catch {}
     }
   } catch {}
+  if (state.silenceTimer) {
+    clearInterval(state.silenceTimer);
+    state.silenceTimer = null;
+  }
   state.server = null;
   state.queue.length = 0;
   state.closed = false;
@@ -8223,7 +12186,7 @@ function getRecentReleasedSeats(page, withinMs = 3000) {
 // Immediate sniper wake-up when WebSocket reports released seats.
 async function onWsSeatReleased(page, labels) {
   const session = findSessionByPage(page);
-  if (!session || session.stopRequested) return;
+  if (!session || session.stopRequested || session.isTransferring) return;
   const speed = getSpeedSettings(session?.speedSettings);
   const state = wsRouteRegistry.get(page);
   if (state) state.skipItemCache = true;
@@ -8369,7 +12332,7 @@ async function sendHoldViaRoute(page, seats, opts = {}) {
     const batchPayload = { action: 'hold-object', objects: wanted.map(objectId => ({ objectId })), token: activeHoldToken, tracing_id: tracingId };
     state.server.send(compressWsMessage(JSON.stringify(batchPayload)));
     fileLog('INFO', `sendHoldViaRoute sent batch hold for ${wanted.length} seats`);
-    await waitFor(Math.min(200, Math.max(40, wanted.length * 3)));
+    await waitFor(Math.min(150, Math.max(30, wanted.length * 2)));
     const batchErrors = collectWsErrors(state);
     if (looksLikeHoldTokenSaturated(batchErrors)) {
       emitStatus('seats-token-saturated', `Hold token is saturated/invalid (${batchErrors[0]?.message?.slice(0, 80) || ''}); trying to rotate token`, { account: opts.username || '', tokenPrefix: activeHoldToken.slice(0, 8) });
@@ -8378,7 +12341,7 @@ async function sendHoldViaRoute(page, seats, opts = {}) {
         state.queue.length = 0;
         const rotatedPayload = { action: 'hold-object', objects: wanted.map(objectId => ({ objectId })), token: activeHoldToken, tracing_id: tracingId };
         state.server.send(compressWsMessage(JSON.stringify(rotatedPayload)));
-        await waitFor(Math.min(200, Math.max(40, wanted.length * 3)));
+        await waitFor(Math.min(150, Math.max(30, wanted.length * 2)));
       } else {
         return verifiedHeld;
       }
@@ -8415,7 +12378,7 @@ async function sendHoldViaRoute(page, seats, opts = {}) {
     }
 
     // Wait for acks / server broadcast, then verify with the API truth endpoint.
-    await waitFor(Math.min(180, Math.max(35, chunk.length * 4)));
+    await waitFor(Math.min(120, Math.max(25, chunk.length * 3)));
     const chunkErrors = collectWsErrors(state);
     if (looksLikeHoldTokenSaturated(chunkErrors)) {
       emitStatus('seats-token-saturated', `Hold token is saturated/invalid (${chunkErrors[0]?.message?.slice(0, 80) || ''}); trying to rotate token`, { account: opts.username || '', tokenPrefix: activeHoldToken.slice(0, 8) });
@@ -8704,30 +12667,137 @@ async function attemptRouteHoldWithCartVerify(page, targetSections, targetCount,
   return wsHeld.slice(0, targetCount);
 }
 
+// ------------------------------------------------------------------
+// API resilience: circuit breaker + idempotent retries
+// ------------------------------------------------------------------
+const API_BREAKERS = new Map();
+const API_BREAKER_FAILURE_THRESHOLD = 5;
+const API_BREAKER_RESET_MS = 30000;
+const API_RETRY_MAX = 2;
+const API_RETRY_DELAY_MS = 150;
+const API_RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function getApiBreaker(key) {
+  if (!API_BREAKERS.has(key)) {
+    API_BREAKERS.set(key, { state: 'CLOSED', failures: 0, lastFailure: 0, halfOpenAttempts: 0 });
+  }
+  const b = API_BREAKERS.get(key);
+  const now = Date.now();
+  if (b.state === 'OPEN' && now - b.lastFailure > API_BREAKER_RESET_MS) {
+    b.state = 'HALF_OPEN';
+    b.failures = 0;
+    b.halfOpenAttempts = 0;
+  }
+  return b;
+}
+
+function isApiBreakerOpen(key) {
+  const b = getApiBreaker(key);
+  if (b.state === 'OPEN') return true;
+  if (b.state === 'HALF_OPEN' && b.halfOpenAttempts >= 1) return true;
+  return false;
+}
+
+function recordApiBreakerResult(key, success) {
+  const b = getApiBreaker(key);
+  if (success) {
+    if (b.state === 'HALF_OPEN') {
+      b.state = 'CLOSED';
+    }
+    b.failures = Math.max(0, b.failures - 1);
+    b.halfOpenAttempts = 0;
+  } else {
+    b.lastFailure = Date.now();
+    if (b.state === 'HALF_OPEN') {
+      b.state = 'OPEN';
+      b.failures = API_BREAKER_FAILURE_THRESHOLD;
+    } else {
+      b.failures += 1;
+      if (b.failures >= API_BREAKER_FAILURE_THRESHOLD) {
+        b.state = 'OPEN';
+      }
+    }
+  }
+}
+
+function getApiHostname(url) {
+  try { return new URL(url).hostname; } catch { return 'default'; }
+}
+
 async function sessionFetch(url, options = {}, session = null) {
   // Use the session's Playwright request context when available so the call
   // inherits the user's cookies and proxy. Falls back to the global fetch.
-  if (session?.context?.request) {
-    const pwOpts = { ...options, timeout: options.timeout || 15000 };
-    if ('body' in pwOpts) {
-      pwOpts.data = pwOpts.body;
-      delete pwOpts.body;
-    }
+  // Wraps every request with circuit-breaker + idempotency-key + limited retries.
+  const resilience = options.__resilience || {};
+  const maxRetries = typeof resilience.maxRetries === 'number' ? resilience.maxRetries : API_RETRY_MAX;
+  const retryDelayMs = typeof resilience.retryDelayMs === 'number' ? resilience.retryDelayMs : API_RETRY_DELAY_MS;
+  const retryStatuses = resilience.retryStatuses ? new Set(resilience.retryStatuses) : API_RETRY_STATUSES;
+  const breakerKey = resilience.breakerKey || getApiHostname(url);
+  const skipBreaker = !!resilience.skipBreaker;
+
+  if (!skipBreaker && isApiBreakerOpen(breakerKey)) {
+    fileLog('WARN', `[resilience] circuit breaker OPEN for ${breakerKey}; rejecting ${url}`);
+    throw new Error(`Circuit breaker open for ${breakerKey}`);
+  }
+
+  const idempotencyKey = crypto.randomUUID();
+  const baseOptions = { ...options };
+  delete baseOptions.__resilience;
+  baseOptions.headers = baseOptions.headers ? { ...baseOptions.headers } : {};
+  baseOptions.headers['Idempotency-Key'] = idempotencyKey;
+
+  let lastError = null;
+  let lastRes = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await session.context.request.fetch(url, pwOpts);
-      return {
-        ok: res.ok(),
-        status: res.status(),
-        headers: res.headers(),
-        text: () => res.text(),
-        json: () => res.json(),
-        arrayBuffer: () => res.body().then(b => Buffer.from(b)),
-      };
+      let res;
+      if (session?.context?.request) {
+        const pwOpts = { ...baseOptions, timeout: baseOptions.timeout || 15000 };
+        if ('body' in pwOpts) {
+          pwOpts.data = pwOpts.body;
+          delete pwOpts.body;
+        }
+        // Playwright's request.fetch does not accept an AbortSignal; rely on its timeout.
+        delete pwOpts.signal;
+        res = await session.context.request.fetch(url, pwOpts);
+        lastRes = {
+          ok: res.ok(),
+          status: res.status(),
+          headers: res.headers(),
+          text: () => res.text(),
+          json: () => res.json(),
+          arrayBuffer: () => res.body().then(b => Buffer.from(b)),
+        };
+      } else {
+        res = await fetch(url, baseOptions);
+        lastRes = res;
+      }
+
+      if (lastRes.ok || !retryStatuses.has(lastRes.status)) {
+        if (!skipBreaker) recordApiBreakerResult(breakerKey, true);
+        return lastRes;
+      }
+
+      lastError = new Error(`HTTP ${lastRes.status}`);
+      if (attempt < maxRetries) {
+        const delay = retryDelayMs * (2 ** attempt) + Math.floor(Math.random() * 100);
+        fileLog('INFO', `[resilience] ${breakerKey} HTTP ${lastRes.status} attempt ${attempt + 1}/${maxRetries + 1}; retrying in ${delay}ms`);
+        await waitFor(delay);
+      }
     } catch (e) {
-      fileLog('WARN', `sessionFetch via context failed: ${e.message}; falling back to global fetch`);
+      lastError = e;
+      if (attempt < maxRetries) {
+        const delay = retryDelayMs * (2 ** attempt) + Math.floor(Math.random() * 100);
+        fileLog('INFO', `[resilience] ${breakerKey} request error: ${e.message} attempt ${attempt + 1}/${maxRetries + 1}; retrying in ${delay}ms`);
+        await waitFor(delay);
+      }
     }
   }
-  return fetch(url, options);
+
+  if (!skipBreaker) recordApiBreakerResult(breakerKey, false);
+  if (lastRes) return lastRes;
+  throw lastError;
 }
 
 async function getProxyIp(session) {
@@ -8923,6 +12993,58 @@ async function waitForChartWebSocket(frame, timeoutMs = 30000) {
   return false;
 }
 
+function installChartDetectionHook(page, session) {
+  if (!page || !session) return;
+  session.__chartWsReady = false;
+  session.__chartFrameAttached = false;
+  session.__chartWsAttachedAt = 0;
+
+  const onFrame = (frame) => {
+    const url = frame.url() || '';
+    if (url.includes('seatcloud') || url.includes('seats.io') || url.includes('chart.seatcloud')) {
+      session.__chartFrameAttached = true;
+      session.__chartFrameAttachedAt = Date.now();
+    }
+  };
+  const onWebSocket = (ws) => {
+    const url = ws.url() || '';
+    if (url.includes('seatcloud') || url.includes('seats.io')) {
+      session.__chartWsReady = true;
+      session.__chartWsAttachedAt = Date.now();
+      ws.on('close', () => {
+        session.__chartWsReady = false;
+      });
+    }
+  };
+  page.on('frameattached', onFrame);
+  page.on('frameready', onFrame);
+  page.on('websocket', onWebSocket);
+}
+
+async function waitForChartAndStartImmediate(page, session, options = {}) {
+  const timeoutMs = options.timeoutMs || 30000;
+  const pollIntervalMs = options.pollIntervalMs || 200;
+  const start = Date.now();
+  const username = session?.username || 'unknown';
+
+  while (Date.now() - start < timeoutMs) {
+    const frame = await findChartFrame(page, username);
+    if (frame) {
+      const hasSvg = await frame.evaluate(() => !!document.querySelector('svg, [class*="seat" i], [class*="object" i], canvas')).catch(() => false);
+      const wsReady = await frame.evaluate(() => window.__chartWS && window.__chartWS.readyState === 1).catch(() => false);
+      if (hasSvg || wsReady || session?.__chartWsReady) {
+        return { frame, chartFrame: frame, elapsed: Date.now() - start };
+      }
+    }
+    if (session?.__chartFrameAttached || session?.__chartWsReady) {
+      const maybeFrame = await findChartFrame(page, username);
+      if (maybeFrame) return { frame: maybeFrame, chartFrame: maybeFrame, elapsed: Date.now() - start };
+    }
+    await waitFor(pollIntervalMs);
+  }
+  throw new Error(`Chart did not become ready within ${timeoutMs}ms for ${username}`);
+}
+
 function sha256Utf8(text) {
   return crypto.createHash('sha256').update(Buffer.from(text, 'utf8')).digest();
 }
@@ -9017,9 +13139,9 @@ function decodeSeatcloudItems(rawBytes, { eventKey, holdToken } = {}) {
   }
 }
 
-async function fetchSeatcloudItemsRaw(workspaceKey, eventKey, session = null, channel = 'NO_CHANNEL', paramName = 'allocations') {
+async function fetchSeatcloudItemsRaw(workspaceKey, eventKey, session = null, channel = 'NO_CHANNEL', paramName = 'allocations', signal = null) {
   const url = `https://api.seatcloud.com/api/v2/${workspaceKey}/event/${eventKey}/items?${paramName}=${encodeURIComponent(channel)}&trace_id=${makeTraceId()}&plain=true`;
-  const res = await sessionFetch(url, {
+  const fetchOptions = {
     headers: {
       'Accept': 'application/json',
       'Accept-Encoding': 'identity',
@@ -9027,7 +13149,15 @@ async function fetchSeatcloudItemsRaw(workspaceKey, eventKey, session = null, ch
       'Origin': WB_ORIGIN,
       'Referer': `${WB_ORIGIN}/`,
     },
-  }, session);
+  };
+  // Defensive: ensure a usable AbortSignal is always present.
+  let effectiveSignal = signal;
+  if (!effectiveSignal || typeof effectiveSignal !== 'object' || typeof effectiveSignal.aborted === 'undefined') {
+    const controller = new AbortController();
+    effectiveSignal = controller.signal;
+  }
+  fetchOptions.signal = effectiveSignal;
+  const res = await sessionFetch(url, fetchOptions, session);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   const items = decodeSeatcloudItems(buf, { eventKey });
@@ -9086,23 +13216,35 @@ async function fetchSeatcloudItems(workspaceKey, eventKey, session = null, expli
     let bestAvailable = -1;
     let lastError = null;
 
-    for (const { param, channel: ch } of candidates) {
-      try {
-        const { items, bytes } = await fetchSeatcloudItemsRaw(workspaceKey, eventKey, session, ch, param);
-        const avail = totalAvailableCount(items);
-        const hasData = Array.isArray(items) && items.length > 0;
-        fileLog('INFO', `[fetchSeatcloudItems] ${param}=${ch} => ${bytes} bytes, ${Array.isArray(items) ? items.length : 0} items, avail=${avail}`);
-        if (hasData && (avail > bestAvailable || (!bestResult && avail === 0))) {
-          bestResult = { items, param, channel: ch };
-          bestAvailable = avail;
-          if (avail > 0) {
-            // We found real availability; stop searching.
-            break;
-          }
+    // Run candidate channel/param combinations in parallel with a per-candidate
+    // timeout so slow or invalid channels do not block the sniper.
+    const CANDIDATE_TIMEOUT_MS = 5000;
+    const candidateResults = await Promise.allSettled(
+      candidates.map(async ({ param, channel: ch }) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CANDIDATE_TIMEOUT_MS);
+        try {
+          const { items, bytes } = await fetchSeatcloudItemsRaw(workspaceKey, eventKey, session, ch, param, controller.signal);
+          const avail = totalAvailableCount(items);
+          const hasData = Array.isArray(items) && items.length > 0;
+          fileLog('INFO', `[fetchSeatcloudItems] ${param}=${ch} => ${bytes} bytes, ${Array.isArray(items) ? items.length : 0} items, avail=${avail}`);
+          return { items, param, channel: ch, avail, hasData };
+        } finally {
+          clearTimeout(timer);
         }
-      } catch (e) {
-        lastError = e;
-        fileLog('INFO', `[fetchSeatcloudItems] ${param}=${ch} failed: ${e.message}`);
+      })
+    );
+
+    for (const result of candidateResults) {
+      if (result.status === 'rejected') {
+        lastError = result.reason;
+        fileLog('INFO', `[fetchSeatcloudItems] candidate failed: ${result.reason?.message || result.reason}`);
+        continue;
+      }
+      const { items, param, channel: ch, avail, hasData } = result.value;
+      if (hasData && (avail > bestAvailable || (!bestResult && avail === 0))) {
+        bestResult = { items, param, channel: ch };
+        bestAvailable = avail;
       }
     }
 
@@ -9244,7 +13386,7 @@ async function validateHoldToken(workspaceKey, eventKey, holdToken, channel = 'N
   const paramName = session?.itemsParamName || 'allocations';
   const url = `https://api.seatcloud.com/api/v2/${workspaceKey}/event/${eventKey}/items/held?hold_token=${encodeURIComponent(holdToken)}&${paramName}=${encodeURIComponent(channel)}&trace_id=${makeTraceId()}&plain=true`;
   try {
-    const res = await fetch(url, {
+    const res = await sessionFetch(url, {
       headers: {
         'Accept': 'application/json',
         'Accept-Encoding': 'identity',
@@ -9252,7 +13394,7 @@ async function validateHoldToken(workspaceKey, eventKey, holdToken, channel = 'N
         'Origin': WB_ORIGIN,
         'Referer': `${WB_ORIGIN}/`,
       },
-    });
+    }, session);
     if (!res.ok) return { valid: false, reason: `HTTP ${res.status}` };
     const buf = Buffer.from(await res.arrayBuffer());
     const held = decodeSeatcloudItems(buf, { eventKey, holdToken });
@@ -9370,6 +13512,73 @@ async function getTicketCount(page) {
   });
 }
 
+async function refreshPageToSyncCart(session) {
+  // If the WeBook parent page still shows fewer tickets than the server holds,
+  // reload the booking page with the hold token so the React cart rehydrates
+  // from the SeatCloud held-items API. This fixes the common mismatch where the
+  // chart iframe shows 30 held seats but the sticky cart summary shows 5.
+  if (!session?.page || await isPageClosed(session.page) || !session.holdToken) return;
+  const { page, username, holdToken, selectedSeats } = session;
+  if (!selectedSeats?.length) return;
+  try {
+    const cartCount = await getTicketCount(page);
+    if (cartCount >= selectedSeats.length) return;
+    emitStatus('cart-refresh', `Cart shows ${cartCount} ticket(s) but ${selectedSeats.length} held; refreshing booking page to sync`, {
+      account: username,
+      cartCount,
+      held: selectedSeats.length,
+    });
+    let refreshUrl = page.url();
+    if (!refreshUrl.includes('/book')) {
+      refreshUrl = refreshUrl.replace(/\/?$/, '/book');
+    }
+    refreshUrl = refreshUrl.replace(/([?&])hold_token=[^&]*/g, '$1');
+    refreshUrl = refreshUrl.replace(/\?&/, '?').replace(/&&/g, '&').replace(/[?&]$/, '');
+    refreshUrl += `${refreshUrl.includes('?') ? '&' : '?'}hold_token=${encodeURIComponent(holdToken)}`;
+    await page.goto(refreshUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitFor(2500);
+    await dismissAllBanners(page, username, 'post-cart-refresh');
+    const frame = await findChartFrame(page, username);
+    if (frame) {
+      await syncChartSelection(frame, selectedSeats, { page, username });
+      emitStatus('cart-refreshed', `Booking page refreshed; re-synced ${selectedSeats.length} seat(s) to chart`, { account: username, seats: selectedSeats });
+    }
+  } catch (e) {
+    fileLog('WARN', `[${session.username}] refreshPageToSyncCart warning: ${e.message}`);
+  }
+}
+
+async function extendHoldTokenViaRestApi(session, minutes = 15) {
+  if (!session?.holdToken) return { success: false, reason: 'no-hold-token' };
+  const token = session.holdToken;
+  const endpoints = [
+    `https://api.seatcloud.com/api/v2/hold-tokens/${encodeURIComponent(token)}`,
+    `https://api.seatcloud.com/hold-tokens/${encodeURIComponent(token)}`,
+    `https://api-eu.seatsio.net/hold-tokens/${encodeURIComponent(token)}`,
+    `https://api-na.seatsio.net/hold-tokens/${encodeURIComponent(token)}`,
+  ];
+  const body = JSON.stringify({ expiresInMinutes: minutes });
+  for (const url of endpoints) {
+    try {
+      const res = await sessionFetch(url, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Origin': WB_ORIGIN, 'Referer': `${WB_ORIGIN}/` },
+        body,
+      }, session);
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        fileLog('INFO', `[${session.username}] Hold token extended via REST: ${url}`);
+        return { success: true, endpoint: url, expiresAt: data.expiresAt, expiresInSeconds: data.expiresInSeconds, newToken: data.holdToken || token };
+      }
+      const text = await res.text().catch(() => '');
+      fileLog('INFO', `[${session.username}] Hold token REST extension attempt failed at ${url}: HTTP ${res.status} ${text.slice(0, 200)}`);
+    } catch (e) {
+      fileLog('INFO', `[${session.username}] Hold token REST extension attempt error at ${url}: ${e.message}`);
+    }
+  }
+  return { success: false, reason: 'all-endpoints-failed' };
+}
+
 async function extendHoldToken(session) {
   if (!session || !session.page || await isPageClosed(session.page)) {
     return { success: false, error: 'No active session page' };
@@ -9377,7 +13586,29 @@ async function extendHoldToken(session) {
   const oldToken = session.holdToken;
   const pageSlug = parseSlug(session.page.url());
   try {
-    // Attempt to obtain a fresh hold token from the chart state or API.
+    // Primary attempt: extend the existing token through the public REST API.
+    // This works when SeatCloud/Seats.io exposes a public hold-token extension
+    // endpoint; otherwise we fall back to refreshing the token via the chart.
+    try {
+      const restExt = await extendHoldTokenViaRestApi(session, HOLD_TOKEN_EXTENSION_MINUTES);
+      if (restExt.success) {
+        const serverExpiresAt = restExt.expiresAt || null;
+        touchHoldToken(session, session.holdToken, HOLD_TOKEN_EXTENSION_MINUTES, serverExpiresAt);
+        const verified = await verifyHeldSeatsViaApi(session.page, session.holdToken, session.selectedSeats, { session });
+        emitStatus('token-extended', `Hold token extended via REST; verified ${verified.length}/${session.selectedSeats.length} seats`, {
+          account: session.username,
+          oldToken: oldToken ? `${oldToken.slice(0, 12)}...` : null,
+          newToken: `${session.holdToken.slice(0, 12)}...`,
+          seats: verified,
+          viaRest: true,
+        });
+        return { success: true, oldToken, newToken: session.holdToken, verifiedSeats: verified, viaRest: true };
+      }
+    } catch (e) {
+      fileLog('INFO', `[${session.username}] REST extension error: ${e.message}`);
+    }
+
+    // Fallback: obtain a fresh hold token from the chart state or API and re-hold seats.
     let newToken = await readChartHoldToken(session.page, pageSlug);
     if (!newToken && pageSlug) {
       try {
@@ -9392,9 +13623,13 @@ async function extendHoldToken(session) {
     if (newToken === oldToken) {
       // Even if the token did not change, the act of re-reading may have refreshed cookie state.
       // Re-send holds to extend the server-side expiry.
+      touchHoldToken(session, newToken, HOLD_TOKEN_EXTENSION_MINUTES);
       await syncQueueTokenToCookie(session.context, null, newToken);
     } else {
+      if (oldToken) unregisterHoldToken(oldToken);
       session.holdToken = newToken;
+      touchHoldToken(session, newToken, HOLD_TOKEN_EXTENSION_MINUTES);
+      registerHoldToken(session.username, newToken);
       await syncQueueTokenToCookie(session.context, null, newToken);
       fileLog('INFO', `[${session.username}] Hold token refreshed: ${oldToken?.slice(0, 12)}... -> ${newToken.slice(0, 12)}...`);
     }
@@ -9406,7 +13641,19 @@ async function extendHoldToken(session) {
       await sendHoldViaFrame(frame, session.selectedSeats, { token: session.holdToken, tracingId: wsParams.tracingId, page: session.page, username: session.username });
     }
 
-    const verified = await verifyHeldSeatsViaApi(session.page, session.holdToken, session.selectedSeats, { session });
+    let verified = await verifyHeldSeatsViaApi(session.page, session.holdToken, session.selectedSeats, { session });
+
+    // If extension/rotation resulted in zero held seats, attempt immediate recovery.
+    if (session.selectedSeats.length > 0 && (!verified || verified.length === 0)) {
+      emitStatus('token-zero-held', `Hold token valid but zero seats held; attempting recovery`, { account: session.username });
+      const frame = await findChartFrame(session.page, session.username);
+      if (frame) {
+        const wsParams = await readChartWsParams(session.page);
+        await sendHoldViaFrame(frame, session.selectedSeats, { token: session.holdToken, tracingId: wsParams.tracingId, page: session.page, username: session.username });
+        verified = await verifyHeldSeatsViaApi(session.page, session.holdToken, session.selectedSeats, { session });
+      }
+    }
+
     emitStatus('token-extended', `Hold token extended; verified ${verified.length}/${session.selectedSeats.length} seats`, {
       account: session.username,
       oldToken: oldToken ? `${oldToken.slice(0, 12)}...` : null,
@@ -9444,6 +13691,7 @@ async function refreshHoldTokenIfSaturated(session, needed, workspaceKey, eventK
           const newToken = await getHoldTokenFromApi(pageSlug, eventId, session);
           if (newToken && newToken !== session.holdToken) {
             session.holdToken = newToken;
+            touchHoldToken(session, newToken, 15);
             await syncQueueTokenToCookie(session.context, null, newToken);
             const v3 = await validateHoldToken(workspaceKey, eventKey, session.holdToken, channel, session);
             const cap3 = Math.max(0, MAX_HELD_SEATS - (v3.currentlyHeld || 0));
@@ -9463,31 +13711,65 @@ function startHoldKeepalive(session) {
   if (session.holdInterval) clearInterval(session.holdInterval);
   session.tokenExtensions = session.tokenExtensions || 0;
   session.holdInterval = setInterval(async () => {
-    if (!session.page || session.stopRequested || session.isSelecting) return;
+    if (!session.page || session.stopRequested || session.isSelecting || session.keepalivePaused || session.isTransferring) return;
     if (await isPageClosed(session.page)) return;
+    // Soft-stop (bookingPaused) still extends/re-holds current seats but never
+    // spawns refills/snipers/watcher so the operator can proceed to payment.
+    const paused = session.bookingPaused;
 
     let frame = null;
     try {
       frame = await findChartFrame(session.page, session.username, { emit: false });
       if (!frame) return;
 
-      // Auto-extend the hold token continuously. We refresh before the timer
-      // drops under 10 minutes and we also try again if the timer is unknown
-      // or already expired, so the server-side hold never ages out.
       const timerSeconds = typeof session.lastPageTimerSeconds === 'number' ? session.lastPageTimerSeconds : null;
-      const shouldExtend = timerSeconds === null || timerSeconds <= 600 || timerSeconds > 0;
+      const serverExpiry = session.holdTokenExpiresAt || 0;
+      const msUntilExpiry = serverExpiry ? serverExpiry - Date.now() : Infinity;
+      const shouldExtendByTimer = timerSeconds !== null && timerSeconds <= HOLD_TOKEN_RENEW_THRESHOLD_SECONDS;
+      const shouldExtendByTime = msUntilExpiry !== Infinity && msUntilExpiry < 5 * 60 * 1000; // < 5 min proactive
+      const shouldExtend = (shouldExtendByTimer || shouldExtendByTime) && !session.tokenExtensionMaxed;
       if (shouldExtend) {
         const lastExt = session.lastTokenExtension || 0;
-        if (Date.now() - lastExt > 30000) {
+        const minInterval = (timerSeconds !== null && timerSeconds <= 30) ? 5000 : 30000;
+        if (Date.now() - lastExt > minInterval) {
           session.lastTokenExtension = Date.now();
-          fileLog('INFO', `[${session.username}] Auto-extending hold token (timer=${timerSeconds}s)`);
-          await extendHoldToken(session);
+          fileLog('INFO', `[${session.username}] Auto-extending hold token (timer=${timerSeconds}s, msUntilExpiry=${msUntilExpiry})`);
+          const ext = await extendHoldToken(session);
+          if (!ext.success) {
+            session.tokenExtensionFailures = (session.tokenExtensionFailures || 0) + 1;
+            if (session.tokenExtensionFailures >= 2) {
+              session.tokenExtensionMaxed = true;
+              emitStatus('token-extension-maxed', `Hold token reached maximum TTL; automatic extension stopped`, { account: session.username });
+            }
+          } else {
+            session.tokenExtensionFailures = 0;
+            // Hard ceiling: Seats.io max token lifetime is 2 hours.
+            if (session.holdTokenFirstCreatedAt && Date.now() - session.holdTokenFirstCreatedAt >= 2 * 60 * 60 * 1000) {
+              session.tokenExtensionMaxed = true;
+              emitStatus('token-extension-maxed', `Hold token reached 2-hour absolute max`, { account: session.username });
+            }
+          }
+        }
+      }
+
+      // Critical last-chance extension: if the timer is about to hit zero, force
+      // a token refresh/re-hold immediately, bypassing the 30s cooldown.
+      if (timerSeconds !== null && timerSeconds <= 15 && !session.tokenExtensionMaxed) {
+        fileLog('INFO', `[${session.username}] Critical timer (${timerSeconds}s); forcing immediate hold token extension`);
+        const ext = await extendHoldToken(session);
+        if (ext.success) {
+          session.tokenExtensionFailures = 0;
+          session.lastTokenExtension = Date.now();
         }
       }
 
       // Refresh the hold token in case the chart rotated it.
       const refreshed = await readChartHoldToken(session.page);
-      if (refreshed) session.holdToken = refreshed;
+      if (refreshed && refreshed !== session.holdToken) {
+        if (session.holdToken) unregisterHoldToken(session.holdToken);
+        session.holdToken = refreshed;
+        registerHoldToken(session.username, refreshed);
+      }
 
       // If another active session ended up with the same token, rotate now.
       await ensureUniqueHoldToken(session);
@@ -9498,24 +13780,50 @@ function startHoldKeepalive(session) {
         emitStatus('keepalive-frame-missing', 'Chart iframe not available for keepalive', { account: session.username });
         return;
       }
-      const wsOk = await frame.evaluate(() => window.__chartWS && window.__chartWS.readyState === 1).catch(() => false);
+      let wsOk = await frame.evaluate(() => window.__chartWS && window.__chartWS.readyState === 1).catch(() => false);
       if (!wsOk) {
-        emitStatus('keepalive-ws-missing', 'Chart WebSocket not available for keepalive', { account: session.username });
-        return;
+        emitStatus('keepalive-ws-missing', 'Chart WebSocket not available; attempting reconnect', { account: session.username });
+        try {
+          // Re-install the WebSocket interception route and nudge the chart to reconnect.
+          await setupWebSocketRoute(session.page);
+          await waitFor(500);
+          // Trigger a harmless resize/redraw to encourage the chart to reopen its WS.
+          await frame.evaluate(() => {
+            window.dispatchEvent(new Event('resize'));
+            if (window.chartRender && window.chartRender.redraw) window.chartRender.redraw();
+          }).catch(() => {});
+          await waitFor(500);
+          wsOk = await frame.evaluate(() => window.__chartWS && window.__chartWS.readyState === 1).catch(() => false);
+        } catch (reconnectErr) {
+          fileLog('WARN', `[${session.username}] keepalive WS reconnect error: ${reconnectErr.message}`);
+        }
+        if (!wsOk) {
+          emitStatus('keepalive-ws-missing', 'Chart WebSocket still not available after reconnect attempt', { account: session.username });
+          return;
+        }
       }
 
       const wsParams = await readChartWsParams(session.page);
       const pageSlug = parseSlug(session.page.url());
       const refreshedToken = await readChartHoldToken(session.page, pageSlug);
-      if (refreshedToken) session.holdToken = refreshedToken;
+      if (refreshedToken && refreshedToken !== session.holdToken) {
+        if (session.holdToken) unregisterHoldToken(session.holdToken);
+        session.holdToken = refreshedToken;
+        registerHoldToken(session.username, refreshedToken);
+        touchHoldToken(session, refreshedToken, 15);
+      }
       await sendHoldViaFrame(frame, session.selectedSeats, { token: session.holdToken, tracingId: wsParams.tracingId, page: session.page, username: session.username });
 
       // Verify server-side; if the hold did not stick, try to refill.
       const verified = await verifyHeldSeatsViaApi(session.page, session.holdToken, session.selectedSeats, { session });
-      emitStatus('keepalive', `Re-held ${verified.length}/${session.selectedSeats.length} seats (server verified)`, { account: session.username, seats: verified });
+      if (paused) {
+        emitStatus('keepalive-paused', `Hold extended while paused: ${verified.length}/${session.selectedSeats.length} seats still held`, { account: session.username, seats: verified });
+      } else {
+        emitStatus('keepalive', `Re-held ${verified.length}/${session.selectedSeats.length} seats (server verified)`, { account: session.username, seats: verified });
+      }
 
       const cappedTarget = Math.min(session.targetSeatCount || 30, MAX_HELD_SEATS);
-      if (verified.length < cappedTarget) {
+      if (verified.length < cappedTarget && !paused) {
         const lost = session.selectedSeats.filter(s => !verified.includes(s));
         if (lost.length) {
           emitStatus('keepalive-lost', `Seats lost on server: ${lost.join(', ')}`, { account: session.username, lost });
@@ -9549,6 +13857,14 @@ function startHoldKeepalive(session) {
           }
         }
       }
+
+      // Early detection: if we previously held seats but now hold none, attempt immediate recovery.
+      if (session.selectedSeats.length > 0 && verified.length === 0) {
+        emitStatus('token-lost-all-holds', `All seats lost; hold token may have expired`, { account: session.username });
+        session.tokenExtensionFailures = 0;
+        const ext = await extendHoldToken(session);
+        if (ext.success) session.lastTokenExtension = Date.now();
+      }
     } catch (e) {
       if (e && (e.message || '').includes('Target page, context or browser has been closed')) {
         // Expected when the user/browser closed the session; do not spam logs.
@@ -9566,12 +13882,46 @@ function clearHoldKeepalive(session) {
   }
 }
 
+function pauseKeepalive(session) {
+  if (!session) return;
+  session.keepalivePaused = true;
+  fileLog('INFO', `[${session.username}] Keepalive paused`);
+}
+
+function resumeKeepalive(session) {
+  if (!session) return;
+  session.keepalivePaused = false;
+  fileLog('INFO', `[${session.username}] Keepalive resumed`);
+}
+
+function pauseSnipersForSections(seats) {
+  const set = new Set((seats || []).map(s => String(s).split('-')[0].toUpperCase()));
+  for (const [u, s] of activeSessions.entries()) {
+    if (u === s?.__transferTarget) continue; // do not pause the destination itself; it needs to capture
+    if (!s.sniperInterval) continue;
+    const monitored = (s.sniperSections || []).map(x => String(x).toUpperCase());
+    if (monitored.some(m => set.has(m))) {
+      stopActiveSniper(s);
+      pausedSnipersForTransfer.set(u, { sections: s.sniperSections || [], wasActive: true });
+    }
+  }
+}
+function resumePausedTransferSnipers() {
+  for (const [u, info] of pausedSnipersForTransfer.entries()) {
+    const s = activeSessions.get(u);
+    if (s && !s.stopRequested && info.wasActive) {
+      startActiveSniper(s, info.sections || s.sniperSections || []);
+    }
+  }
+  pausedSnipersForTransfer.clear();
+}
+
 function startHoldWatcher(session) {
   if (session.watchInterval) clearInterval(session.watchInterval);
   const targetSeatCount = Math.min(session.targetSeatCount || 30, MAX_HELD_SEATS);
   let lowCountStreak = 0;
   session.watchInterval = setInterval(async () => {
-    if (!session.page || session.stopRequested || session.isSelecting || await isPageClosed(session.page)) return;
+    if (!session.page || session.stopRequested || session.bookingPaused || session.isSelecting || await isPageClosed(session.page)) return;
 
     try {
       // Verify against the server, not the UI cart counter.
@@ -9638,6 +13988,7 @@ function clearHoldWatcher(session) {
 // ------------------------------------------------------------------
 const sniperItemCache = new Map(); // key -> { ts, items }
 const SNIPER_CACHE_TTL_MS = 250;
+const SNIPER_CACHE_MAX_SIZE = 1000;
 const SEATCLOUD_FETCH_LOCKS = new Map(); // key -> promise
 
 function getCachedItems(key, fetcher, skipCache = false) {
@@ -9646,6 +13997,7 @@ function getCachedItems(key, fetcher, skipCache = false) {
   if (!skipCache && cached && now - cached.ts < SNIPER_CACHE_TTL_MS) return Promise.resolve(cached.items);
   return fetcher().then(items => {
     sniperItemCache.set(key, { ts: Date.now(), items });
+    trimCache(sniperItemCache, SNIPER_CACHE_MAX_SIZE);
     return items;
   });
 }
@@ -9659,6 +14011,12 @@ function startActiveSniper(session, sections) {
   }
   session.sniperActive = true;
   session.sniperSections = (sections || []).map(s => String(s).trim().toUpperCase()).filter(Boolean);
+  const targetSeats = Array.isArray(session.sniperTargetSeats) ? session.sniperTargetSeats : [];
+  // Pre-compute target-seat mode once per tick; it must be known before the
+  // isSelecting/isTransferring guard so the destination sniper keeps running
+  // while it waits for released seats during a transfer.
+  const targetSeatMode = targetSeats.length > 0;
+  const targetSeatSet = targetSeatMode ? new Set(targetSeats.map(s => String(s).trim().toUpperCase())) : null;
   session.sniperLastItems = [];
   session.sniperLastAvailable = new Set();
 
@@ -9671,7 +14029,10 @@ function startActiveSniper(session, sections) {
       }
       // A separate in-progress hold attempt is already running (possibly fired by
       // the WebSocket release handler); skip this tick but stay alive.
-      if (session.isSelecting) return;
+      // In target-seat mode we are allowed to run even while isTransferring/isSelecting
+      // because the destination is intentionally waiting for released seats.
+      if (session.isSelecting && !targetSeatMode) return;
+      if (session.isTransferring && !targetSeatMode) return;
 
       const loopStart = Date.now();
       const targetCount = Math.min(session.targetSeatCount || 30, MAX_HELD_SEATS);
@@ -9722,6 +14083,17 @@ function startActiveSniper(session, sections) {
           const label = String(item.label || item.name || item.objectId || item.id || '').trim();
           if (!label) continue;
           if (!current.includes(label) && !releasedSet.has(label.toUpperCase()) && !isSeatReserved(label, session.username)) {
+            // Skip seats that belong to an active transfer source/destination.
+            let belongsToTransfer = false;
+            for (const [otherUser, otherSession] of activeSessions.entries()) {
+              if (otherUser === session.username) continue;
+              if (!otherSession.isTransferring && !isUsernameWhitelistedForTransfer(otherUser)) continue;
+              if ((otherSession.selectedSeats || []).includes(label)) {
+                belongsToTransfer = true;
+                break;
+              }
+            }
+            if (belongsToTransfer) continue;
             if (!session.sniperLastAvailable.has(label)) newlyAvailable.push(label);
             session.sniperLastAvailable.add(label);
           }
@@ -9744,14 +14116,18 @@ function startActiveSniper(session, sections) {
       // ------------------------------------------------------------------
       // 3. Instantly grab any newly released seat in a monitored section.
       //    Skip sections another account is actively selecting to avoid races.
+      //    In target-seat mode only watch the assigned target seats.
       // ------------------------------------------------------------------
-      const relevantNew = newlyAvailable.filter(l => {
+      let relevantNew = newlyAvailable.filter(l => {
         const sec = String(l).split('-')[0].toUpperCase();
         return safeMonitored.includes(sec);
       });
+      if (targetSeatMode) {
+        relevantNew = relevantNew.filter(l => targetSeatSet.has(String(l).trim().toUpperCase()));
+      }
 
-      if (relevantNew.length && current.length < MAX_HELD_SEATS) {
-        const slots = Math.min(relevantNew.length, MAX_HELD_SEATS - current.length);
+      if (relevantNew.length && current.length < targetCount) {
+        const slots = Math.min(relevantNew.length, targetCount - current.length);
         const toHold = relevantNew.slice(0, slots);
         // Reserve newly released labels before attempting the hold to avoid races.
         reserveSeats(session.username, toHold);
@@ -9778,26 +14154,39 @@ function startActiveSniper(session, sections) {
       // ------------------------------------------------------------------
       // 4. If still below target, hold exact available labels rather than
       //    relying solely on bestAvailable (which can fail on partial blocks).
+      //    In target-seat mode prioritize the assigned target seats.
       // ------------------------------------------------------------------
       let need = Math.max(0, targetCount - session.selectedSeats.length);
-      if (need > 0 && hasAvailability && session.selectedSeats.length < MAX_HELD_SEATS) {
+      if (need > 0 && (hasAvailability || targetSeatMode) && session.selectedSeats.length < targetCount) {
         const availableLabels = [];
         const seen = new Set();
         for (const item of items) {
           if (!item.section || item.availableCount <= 0) continue;
           const sec = String(item.section).toUpperCase();
-          if (!safeMonitored.includes(sec)) continue;
+          if (!safeMonitored.includes(sec) && !targetSeatMode) continue;
           const label = String(item.label || item.name || item.objectId || item.id || '').trim();
           if (!label) continue;
           const up = label.toUpperCase();
           if (session.selectedSeats.includes(label) || releasedSet.has(up) || seen.has(up) || isSeatReserved(label, session.username)) continue;
+          if (targetSeatMode && !targetSeatSet.has(up)) continue;
           seen.add(up);
           availableLabels.push(label);
         }
-        const slots = Math.min(need, MAX_HELD_SEATS - session.selectedSeats.length, availableLabels.length);
+        // In target-seat mode sort target seats first so we grab them in assignment order.
+        if (targetSeatMode) {
+          availableLabels.sort((a, b) => {
+            const ai = targetSeats.indexOf(a);
+            const bi = targetSeats.indexOf(b);
+            if (ai !== -1 && bi !== -1) return ai - bi;
+            if (ai !== -1) return -1;
+            if (bi !== -1) return 1;
+            return 0;
+          });
+        }
+        const slots = Math.min(need, targetCount - session.selectedSeats.length, availableLabels.length);
         if (slots > 0) {
           // Per-account offset so concurrent snipers don't all grab the exact same labels.
-          const accountOffset = (session.accountIndex || 0) % Math.max(1, availableLabels.length);
+          const accountOffset = targetSeatMode ? 0 : ((session.accountIndex || 0) % Math.max(1, availableLabels.length));
           const rotated = [...availableLabels.slice(accountOffset), ...availableLabels.slice(0, accountOffset)];
           const toHold = rotated.slice(0, slots);
           // Reserve exact labels before sending hold frames so another account does
@@ -9828,14 +14217,15 @@ function startActiveSniper(session, sections) {
       // ------------------------------------------------------------------
       // 5. Final fallback: bestAvailable only if exact labels did not help and
       //    the monitored sections are not contested by another active account.
+      //    Skipped in target-seat mode because we only want the assigned seats.
       // ------------------------------------------------------------------
       need = Math.max(0, targetCount - session.selectedSeats.length);
-      if (need > 0 && safeMonitored.length > 0 && hasAvailability) {
+      if (!targetSeatMode && need > 0 && safeMonitored.length > 0 && hasAvailability) {
         emitStatus('seats-sniping', `Sniper firing bestAvailable for ${need} seat(s) in non-contested sections`, { account: session.username, need, sections: safeMonitored });
         session.isSelecting = true;
         try {
           const baStart = Date.now();
-          const held = await sendBestAvailableViaRoute(session.page, need, safeMonitored, 1200, { token: session.holdToken, session });
+          const held = await sendBestAvailableViaRoute(session.page, need, safeMonitored, 800, { token: session.holdToken, session });
           fileLog('TIMER', `[${session.username}] sniper bestAvailable took ${Date.now() - baStart}ms -> ${held.length}/${need}`);
           if (held.length) {
             for (const s of held) if (!session.selectedSeats.includes(s)) session.selectedSeats.push(s);
@@ -9941,21 +14331,11 @@ function startActiveSniper(session, sections) {
     }
   };
 
-  // Run immediately, then on the configured backup polling loop. WebSocket release
+  // Run immediately, then on the configured polling loop. WebSocket release
   // events fire onWsSeatReleased directly for the real-time reaction path;
-  // HTTP polling is now only a fallback to catch any missed WS messages.
-  // Use recursive setTimeout with jitter so multiple accounts do not align their
-  // polls and hammer the API at the exact same instant.
-  function scheduleNext() {
-    if (session.stopRequested) return;
-    const jitter = Math.floor(Math.random() * 40) - 20; // ±20ms
-    const nextMs = Math.max(30, speed.sniperIntervalMs + jitter);
-    session.sniperInterval = setTimeout(async () => {
-      await run();
-      scheduleNext();
-    }, nextMs);
-  }
-  run().then(scheduleNext);
+  // HTTP polling is the fallback to catch any missed WS messages.
+  run();
+  session.sniperInterval = setInterval(run, speed.sniperIntervalMs || 50);
 }
 
 function stopActiveSniper(session) {
@@ -9978,7 +14358,7 @@ async function releaseSingleSeat(session, seat) {
   // same hold token the chart uses (consistent with sendHoldViaRoute).
   if (state && state.server && state.ready && !state.closed) {
     try {
-      const holdToken = session.holdToken || await readChartHoldToken(page, parseSlug(page.url()));
+      const holdToken = await readChartHoldToken(page, parseSlug(page.url()));
       if (holdToken) {
         const wsParams = await readChartWsParams(page);
         const basePayload = {
@@ -10076,7 +14456,102 @@ async function releaseSingleSeat(session, seat) {
   }
 
   if (released) {
-    emitStatus('seat-released', `Released seat ${seat}`, { account: username, seat });
+    emitSeatEvent('seat-released', username, [seat], { source: 'releaseSingleSeat' });
+  }
+  return released;
+}
+
+async function releaseSeatsBatch(session, seats) {
+  const { page, username } = session;
+  if (!page || await isPageClosed(page)) return [];
+  if (!Array.isArray(seats) || seats.length === 0) return [];
+
+  const released = [];
+  const state = wsRouteRegistry.get(page);
+  const frame = await findChartFrame(page, username);
+
+  // 1) Primary: send release through the intercepted WebSocket route in one message.
+  if (state && state.server && state.ready && !state.closed) {
+    try {
+      const holdToken = await readChartHoldToken(page, parseSlug(page.url()));
+      if (holdToken) {
+        const wsParams = await readChartWsParams(page);
+        const objects = seats.map(seat => ({ objectId: seat }));
+        const basePayload = {
+          objects,
+          token: holdToken,
+          tracing_id: wsParams.tracingId || `svr_rel_${Date.now()}`,
+        };
+        for (const action of ['release-object', 'free-object']) {
+          try {
+            state.server.send(compressWsMessage(JSON.stringify({ ...basePayload, action })));
+          } catch {}
+        }
+        released.push(...seats);
+        fileLog('INFO', `[${username}] Sent WS batch release for ${seats.length} seat(s)`);
+      }
+    } catch (e) {
+      fileLog('WARN', `[${username}] releaseSeatsBatch WS route error: ${e.message}`);
+    }
+  }
+
+  // 2) Direct iframe WebSocket fallback.
+  if (released.length === 0 && frame) {
+    try {
+      const wsOk = await frame.evaluate(() => window.__chartWS && window.__chartWS.readyState === 1).catch(() => false);
+      if (wsOk) {
+        const iframeReleased = await frame.evaluate(async (seats) => {
+          const ws = window.__chartWS;
+          async function compressRaw(str) {
+            const cs = new CompressionStream('deflate-raw');
+            const writer = cs.writable.getWriter();
+            writer.write(new TextEncoder().encode(str));
+            writer.close();
+            const chunks = [];
+            const reader = cs.readable.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              chunks.push(value);
+            }
+            let len = 0;
+            chunks.forEach(c => (len += c.length));
+            const out = new Uint8Array(len);
+            let off = 0;
+            chunks.forEach(c => { out.set(c, off); off += c.length; });
+            return out;
+          }
+          const sent = [];
+          for (const action of ['release-object', 'free-object']) {
+            try {
+              const payload = await compressRaw(JSON.stringify({ action, objects: seats.map(s => ({ objectId: s })) }));
+              ws.send(payload);
+              sent.push(...seats);
+            } catch {}
+          }
+          return sent;
+        }, seats);
+        if (iframeReleased.length) released.push(...seats);
+      }
+    } catch (e) {
+      fileLog('WARN', `[${username}] releaseSeatsBatch iframe WS error: ${e.message}`);
+    }
+  }
+
+  // 3) Fallback: release one-by-one through chart API.
+  if (released.length === 0 && frame) {
+    for (const seat of seats) {
+      try {
+        if (await releaseSingleSeat(session, seat)) released.push(seat);
+      } catch (e) {
+        fileLog('WARN', `[${username}] releaseSeatsBatch fallback error for ${seat}: ${e.message}`);
+      }
+    }
+  }
+
+  if (released.length) {
+    emitSeatEvent('seat-released', username, released, { source: 'releaseSeatsBatch' });
+    emitStatus('seats-released-batch', `Released ${released.length} seat(s) in batch`, { account: username, seats: released });
   }
   return released;
 }
@@ -10142,8 +14617,8 @@ async function releaseHold(session) {
 
   // 3. Refresh the page to clear any server-side hold
   try {
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-    await waitFor(1200);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await waitFor(3000);
     emitStatus('hold-released-refresh', 'Refreshed page to clear hold', { account: username });
   } catch (e) {
     fileLog('WARN', `[${username}] releaseHold refresh error: ${e.message}`);
@@ -10156,11 +14631,26 @@ async function releaseHold(session) {
   return released || true;
 }
 
-async function stopSession(username, reason) {
+async function stopSession(username, reason, soft = false) {
   const session = activeSessions.get(username);
   if (!session) return;
+  if (soft) {
+    // Soft stop: keep browser/context open and keep the hold-token extension
+    // alive so currently held seats remain reserved for payment.
+    // Do NOT resolve proceedResolve here, otherwise the bot would auto-click
+    // the "Next: Payment" button. The user must explicitly press Proceed.
+    session.bookingPaused = true;
+    clearHoldWatcher(session);
+    stopActiveSniper(session);
+    emitStatus('stopped', `Session paused (${reason}); held seats remain active`, { account: username, heldSeats: session.selectedSeats || [] });
+    emitAccountUpdate(username, 'paused', { seats: session.selectedSeats || [], reason });
+    emitQueueStats();
+    return;
+  }
   session.stopRequested = true;
-  if (session.proceedResolve) session.proceedResolve();
+  // Resolve any pending proceed signal with 'stop' so the payment loop exits
+  // cleanly instead of hanging forever.
+  if (session.proceedResolve) session.proceedResolve('stop');
   clearHoldKeepalive(session);
   clearHoldWatcher(session);
   stopActiveSniper(session);
@@ -10168,6 +14658,8 @@ async function stopSession(username, reason) {
   try { if (session.page && !await isPageClosed(session.page)) await session.page.close(); } catch {}
   try { await session.context?.close(); } catch {}
   activeSessions.delete(username);
+  releaseProxyReservation(username);
+  unregisterHoldToken(session.holdToken);
   await pruneOldContexts(true);
   emitStatus('stopped', `Session stopped (${reason})`, { account: username });
   emitAccountUpdate(username, 'idle');
@@ -10175,12 +14667,14 @@ async function stopSession(username, reason) {
   processQueue();
 }
 
-async function stopAll(reason) {
+async function stopAll(reason, soft = false) {
   const usernames = Array.from(activeSessions.keys());
-  for (const u of usernames) await stopSession(u, reason);
-  pendingQueue = [];
-  // Also stop any active pair-cycling sessions so held seats are released.
-  try { await pairManager.stopAll(); } catch {}
+  for (const u of usernames) await stopSession(u, reason, soft);
+  if (!soft) {
+    pendingQueue = [];
+    // Also stop any active pair-cycling sessions so held seats are released.
+    try { await pairManager.stopAll(); } catch {}
+  }
   emitQueueStats();
 }
 
@@ -10201,6 +14695,10 @@ async function closeAllSessions() {
     clearHoldKeepalive(session);
     clearHoldWatcher(session);
     stopActiveSniper(session);
+  }
+  for (const [username, session] of activeSessions) {
+    releaseProxyReservation(username);
+    unregisterHoldToken(session.holdToken);
   }
   activeSessions.clear();
   // Close every context we ever opened, including errored-out ones
@@ -10270,6 +14768,10 @@ const server = httpServer.listen(PORT, () => {
       fileLog('WARN', `2captcha key check failed: ${balance.error}`);
     }
   }).catch(() => {});
+
+  // Start periodic proxy health monitoring so dead proxies are detected and
+  // replaced before they cause session failures.
+  startProxyHealthMonitor();
 });
 server.on('error', err => {
   if (err.code === 'EADDRINUSE') {

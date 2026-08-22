@@ -6,6 +6,7 @@
   "scripts": {
     "start": "set NODE_OPTIONS=--max-old-space-size=4096 && node server.js",
     "dev": "set NODE_OPTIONS=--max-old-space-size=4096 && node server.js",
+    "test": "node tests/proxy-manager.test.js && node tests/safety-helpers.test.js",
     "kill": "powershell -Command \"try { Import-Module NetTCPIP -ErrorAction SilentlyContinue } catch {}; try { Get-NetTCPConnection -LocalPort 3456 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } } catch {}; Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*server.js*' } | Stop-Process -Force -ErrorAction SilentlyContinue\" || taskkill //F //IM node.exe //FI \"WINDOWTITLE eq *server.js*\" 2>nul || taskkill //F //IM node.exe 2>nul || true"
   },
   "dependencies": {
