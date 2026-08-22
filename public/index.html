@@ -18,18 +18,17 @@
     <!-- Top Navigation -->
     <nav class="tab-nav" aria-label="Main navigation">
       <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
-      <button class="tab-btn" data-tab="accounts">Accounts</button>
       <button class="tab-btn" data-tab="proxies">Proxies</button>
       <button class="tab-btn" data-tab="settings">Settings</button>
     </nav>
 
-    <!-- Dashboard Tab -->
+    <!-- Dashboard Tab (merged Dashboard + Accounts) -->
     <div class="tab-content active" id="tab-dashboard">
       <!-- Status Dashboard -->
       <section class="card dashboard">
         <div class="dashboard-main">
           <div class="status-pill">
-            <span id="statusBadge" class="badge idle">Idle</span>
+            <span id="statusBadge" class="badge idle">في الانتظار</span>
             <span id="sniperPulse" class="sniper-pulse hidden" title="Sniper active"></span>
           </div>
           <div class="stats-grid">
@@ -53,30 +52,6 @@
         </div>
       </section>
 
-      <!-- Main Control Buttons -->
-      <section class="card dashboard-toolbar">
-        <div class="control-buttons">
-          <button id="startBookingBtn" class="primary big">🚀 بدء الحجز</button>
-          <button id="stopBookingBtn" class="danger big">⛔ إيقاف الكل</button>
-        </div>
-      </section>
-
-      <!-- Logs Section -->
-      <section class="card logs-card">
-        <div class="logs-header">
-          <h2>📊 السجل</h2>
-          <input type="text" id="logSearch" class="log-search" placeholder="بحث أو تصفية..." />
-        </div>
-        <div id="logs" class="logs"></div>
-        <div class="row">
-          <button id="downloadLogsBtn" class="secondary">📥 تحميل السجل</button>
-          <button id="clearLogsBtn" class="secondary">🧹 مسح السجل</button>
-        </div>
-      </section>
-    </div>
-
-    <!-- Accounts Tab -->
-    <div class="tab-content" id="tab-accounts">
       <!-- Event URL Section -->
       <section class="card">
         <h2>🔗 رابط الفعالية</h2>
@@ -94,6 +69,13 @@
           </div>
           <div id="eventInfoBody"></div>
         </div>
+      </section>
+
+      <!-- Sections Selection -->
+      <section class="card">
+        <h2>📋 الأقسام المتاحة <small>(اختر قسماً واحداً أو أكثر)</small></h2>
+        <div id="sectionsList" class="sections-list"></div>
+        <div id="selectionHint" class="hint">اختر قسماً واحداً على الأقل ليتم تفعيل زر بدء الحجز</div>
       </section>
 
       <!-- Accounts Section -->
@@ -164,8 +146,100 @@
           <button id="saveAccountsBtn" type="button">💾 حفظ على الخادم</button>
         </div>
 
+        <div class="row account-bulk-actions-bar">
+          <button id="setAllProxyBtn" type="button">🌐 بروكسي للكل</button>
+          <button id="setAllDirectBtn" type="button">⛔ مباشر للكل</button>
+          <label class="bulk-ticket-label" title="عدد التذاكر الافتراضي لكل الحسابات">
+            🎫 عدد التذاكر للكل:
+            <input type="number" id="bulkTicketCount" value="30" min="1" max="30" />
+          </label>
+          <button id="applyBulkTicketCountBtn" type="button">تطبيق</button>
+        </div>
+
         <div id="accountsList" class="accounts-list"></div>
         <div id="accountsSummary" class="summary">0 حساب محمل</div>
+      </section>
+
+      <!-- Main Control Buttons -->
+      <section class="card dashboard-toolbar">
+        <div class="control-buttons">
+          <button id="startBookingBtn" class="primary big">🚀 بدء الحجز</button>
+          <button id="stopBookingBtn" class="danger big">⛔ إيقاف الكل</button>
+          <button id="stopBookingHardBtn" class="danger big" style="background:#7f1d1d">🛑 إيقاف كامل وإغلاق</button>
+        </div>
+      </section>
+
+      <!-- Seat Transfer -->
+      <section class="card seat-transfer-card">
+        <h2>🔄 نقل المقاعد بين الحسابات</h2>
+        <p class="hint">اختر حساباً أو أكثر كمصدر، وحساباً أو أكثر كوجهة. الحسابات المختارة كمصدر تختفي من قائمة الوجهات.</p>
+
+        <details class="session-management-details">
+          <summary>🔐 إدارة الجلسات المحفوظة</summary>
+          <div class="session-management-content">
+            <p class="hint">استخرج الجلسة من حساب مسجل دخول (مصدر أو وجهة) عشان تستخدمها في النقل بدون 2FA.</p>
+            <div class="session-actions">
+              <button type="button" id="harvestSelectedSessionsBtn" class="secondary">💾 استخراج Session للمحدد</button>
+              <button type="button" id="showCachedSessionsBtn" class="secondary">📋 عرض الجلسات المحفوظة</button>
+            </div>
+            <div id="cachedSessionsList" class="sessions-list"></div>
+          </div>
+        </details>
+
+        <div class="transfer-info row">
+          <span id="cachedSessionsCount">📦 جلسات محفوظة: 0</span>
+          <span id="transferEngineStatus">⚡ النقل التلقائي: v3 ← v2</span>
+        </div>
+
+        <div class="transfer-global-controls row" style="gap:8px;flex-wrap:wrap;align-items:center;">
+          <button type="button" id="setAllTransferProxyBtn" class="secondary tiny">🌐 بروكسي للكل</button>
+          <button type="button" id="setAllTransferDirectBtn" class="secondary tiny">⛔ مباشر للكل</button>
+          <label style="display:flex;align-items:center;gap:4px;margin:0;">🎫 عدد لكل:
+            <input type="number" id="bulkTransferTicketCount" value="5" min="1" max="30" style="width:60px;padding:4px;">
+          </label>
+          <button type="button" id="applyBulkTransferTicketCountBtn" class="secondary tiny">طبق</button>
+        </div>
+
+        <div class="transfer-grid">
+          <div class="transfer-column transfer-from">
+            <div class="transfer-header">
+              <label>من حساب (المصادر)</label>
+              <div class="transfer-header-actions">
+                <button type="button" id="selectAllSourcesBtn" class="tiny">الكل</button>
+                <button type="button" id="deselectAllSourcesBtn" class="tiny secondary">إلغاء</button>
+              </div>
+            </div>
+            <div id="transferFromList" class="transfer-account-list"></div>
+          </div>
+          <div class="transfer-column transfer-to">
+            <div class="transfer-header">
+              <label>إلى حساب (الوجهات)</label>
+              <div class="transfer-header-actions">
+                <button type="button" id="selectAllDestsBtn" class="tiny">الكل</button>
+                <button type="button" id="deselectAllDestsBtn" class="tiny secondary">إلغاء</button>
+              </div>
+            </div>
+            <div id="transferToList" class="transfer-account-list"></div>
+          </div>
+        </div>
+        <div class="row">
+          <button id="transferSeatsHeadlessBtn" class="success" style="background:var(--info);border-color:var(--info);">🚀 نقل مباشر (Headless)</button>
+          <button id="cancelTransferBtn" class="danger hidden">⛔ إلغاء النقل</button>
+        </div>
+        <div id="transferProgressWrapper" class="transfer-progress-wrapper hidden">
+          <div class="transfer-progress-label">
+            <span id="transferProgressText">جاري التحضير...</span>
+            <span id="transferProgressCount">0 / 0</span>
+          </div>
+          <div class="transfer-progress-bar">
+            <div id="transferProgressFill" class="transfer-progress-fill" style="width:0%"></div>
+          </div>
+        </div>
+        <div id="transferDistributionPreview" class="transfer-distribution-preview hidden">
+          <h4>📦 توزيع المقاعد</h4>
+          <div id="transferDistributionList"></div>
+        </div>
+        <div id="transferDestinationStatusList" class="transfer-destination-status-list hidden"></div>
       </section>
 
       <!-- Team Selection -->
@@ -175,11 +249,17 @@
         <div id="teamSelectionHint" class="hint">اختر الفريق المفضل لإظهار الكراسي المخصصة له</div>
       </section>
 
-      <!-- Sections Selection -->
-      <section class="card">
-        <h2>📋 الأقسام المتاحة <small>(اختر قسماً واحداً أو أكثر)</small></h2>
-        <div id="sectionsList" class="sections-list"></div>
-        <div id="selectionHint" class="hint">اختر قسماً واحداً على الأقل ليتم تفعيل زر بدء الحجز</div>
+      <!-- Logs Section -->
+      <section class="card logs-card">
+        <div class="logs-header">
+          <h2>📊 السجل</h2>
+          <input type="text" id="logSearch" class="log-search" placeholder="بحث أو تصفية..." />
+        </div>
+        <div id="logs" class="logs"></div>
+        <div class="row">
+          <button id="downloadLogsBtn" class="secondary">📥 تحميل السجل</button>
+          <button id="clearLogsBtn" class="secondary">🧹 مسح السجل</button>
+        </div>
       </section>
     </div>
 
@@ -255,6 +335,17 @@
           <div id="speedHint" class="hint">سريع: sniper كل 150ms | تيربو: sniper كل 80ms (احترس من الحظر)</div>
         </section>
 
+        <!-- Ticket Limit Auto-Detection -->
+        <section class="card control-card">
+          <h2>🎫 عدد التذاكر</h2>
+          <p class="hint">تفعيل الكشف التلقائي عن الحد الأقصى للتذاكر لكل مستخدم من صفحة الفعالية.</p>
+          <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;margin:10px 0;">
+            <input type="checkbox" id="autoDetectMaxTickets" checked />
+            <span>اكتشاف تلقائي للحد الأقصى</span>
+          </label>
+          <div id="detectedMaxTicketsHint" class="hint info hidden">الحد الأقصى المكتشف: <b id="detectedMaxTicketsValue">—</b></div>
+        </section>
+
         <!-- Pair Cycling Panel -->
         <section class="card">
           <div class="pair-cycling-panel">
@@ -285,6 +376,6 @@
 
   <footer class="dev-footer"><div class="dev-footer-inner"><span class="dev-avatar">👨‍💻</span><div class="dev-info"><strong>Egypt Code Craft</strong><span>✉️ egyptcodecraft@gmail.com</span></div></div></footer>
 
-  <script src="app.js?v=20260812"></script>
+  <script src="app.js?v=20260820"></script>
 </body>
 </html>

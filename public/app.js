@@ -23,14 +23,47 @@ const els = {
   removeAllAccountsBtn: document.getElementById('removeAllAccountsBtn'),
   loadAccountsBtn: document.getElementById('loadAccountsBtn'),
   saveAccountsBtn: document.getElementById('saveAccountsBtn'),
+  setAllProxyBtn: document.getElementById('setAllProxyBtn'),
+  setAllDirectBtn: document.getElementById('setAllDirectBtn'),
+  bulkTicketCount: document.getElementById('bulkTicketCount'),
+  applyBulkTicketCountBtn: document.getElementById('applyBulkTicketCountBtn'),
   maxConcurrency: document.getElementById('maxConcurrency'),
   concurrencyHint: document.getElementById('concurrencyHint'),
   speedModeSelect: document.getElementById('speedModeSelect'),
   speedHint: document.getElementById('speedHint'),
   startBookingBtn: document.getElementById('startBookingBtn'),
   stopBookingBtn: document.getElementById('stopBookingBtn'),
+  stopBookingHardBtn: document.getElementById('stopBookingHardBtn'),
   downloadLogsBtn: document.getElementById('downloadLogsBtn'),
+  autoDetectMaxTickets: document.getElementById('autoDetectMaxTickets'),
+  detectedMaxTicketsHint: document.getElementById('detectedMaxTicketsHint'),
+  detectedMaxTicketsValue: document.getElementById('detectedMaxTicketsValue'),
   clearLogsBtn: document.getElementById('clearLogsBtn'),
+  transferFromList: document.getElementById('transferFromList'),
+  transferToList: document.getElementById('transferToList'),
+  selectAllSourcesBtn: document.getElementById('selectAllSourcesBtn'),
+  deselectAllSourcesBtn: document.getElementById('deselectAllSourcesBtn'),
+  selectAllDestsBtn: document.getElementById('selectAllDestsBtn'),
+  deselectAllDestsBtn: document.getElementById('deselectAllDestsBtn'),
+  transferSeatsBtn: document.getElementById('transferSeatsBtn'),
+  transferSeatsHeadlessBtn: document.getElementById('transferSeatsHeadlessBtn'),
+  setAllTransferProxyBtn: document.getElementById('setAllTransferProxyBtn'),
+  setAllTransferDirectBtn: document.getElementById('setAllTransferDirectBtn'),
+  bulkTransferTicketCount: document.getElementById('bulkTransferTicketCount'),
+  applyBulkTransferTicketCountBtn: document.getElementById('applyBulkTransferTicketCountBtn'),
+  cancelTransferBtn: document.getElementById('cancelTransferBtn'),
+  transferProgressWrapper: document.getElementById('transferProgressWrapper'),
+  transferProgressText: document.getElementById('transferProgressText'),
+  transferProgressCount: document.getElementById('transferProgressCount'),
+  transferProgressFill: document.getElementById('transferProgressFill'),
+  transferDistributionPreview: document.getElementById('transferDistributionPreview'),
+  transferDistributionList: document.getElementById('transferDistributionList'),
+  transferDestinationStatusList: document.getElementById('transferDestinationStatusList'),
+  cachedSessionsCount: document.getElementById('cachedSessionsCount'),
+  transferEngineStatus: document.getElementById('transferEngineStatus'),
+  harvestSelectedSessionsBtn: document.getElementById('harvestSelectedSessionsBtn'),
+  showCachedSessionsBtn: document.getElementById('showCachedSessionsBtn'),
+  cachedSessionsList: document.getElementById('cachedSessionsList'),
   startPairCyclingBtn: document.getElementById('startPairCyclingBtn'),
   stopPairCyclingBtn: document.getElementById('stopPairCyclingBtn'),
   pairCyclesStatus: document.getElementById('pairCyclesStatus'),
@@ -62,6 +95,7 @@ const els = {
   proxyPass: document.getElementById('proxyPass'),
   addProxyBtn: document.getElementById('addProxyBtn'),
   clearProxiesBtn: document.getElementById('clearProxiesBtn'),
+
   statusBadge: document.getElementById('statusBadge'),
   activeCount: document.getElementById('activeCount'),
   pendingCount: document.getElementById('pendingCount'),
@@ -82,9 +116,24 @@ let commonChannelKeys = [];
 let selectedTeam = null;
 let eventTitle = '';
 let eventMaxPerOrder = 30;
+let detectedEventType = 'GENERAL';
+let detectedMaxTickets = 30;
 let accounts = [];
 let running = false;
 let captchaKeys = [];
+
+// Transfer progress tracking.
+let transferProgress = {
+  active: false,
+  totalDestinations: 0,
+  preparedDestinations: 0,
+  totalSeats: 0,
+  transferredSeats: 0,
+  abortController: null,
+};
+
+// Per-destination transfer status tracking.
+let transferDestinationStatuses = new Map(); // username -> { state, seats, transferred, missing, error }
 
 function log(message, type = 'info') {
   const time = new Date().toLocaleTimeString();
@@ -99,6 +148,37 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+
+// Throttle / debounce helpers to keep the UI responsive during heavy bot activity.
+function throttle(fn, limitMs) {
+  let lastCall = 0;
+  let pending = false;
+  return function (...args) {
+    const now = Date.now();
+    if (now - lastCall >= limitMs) {
+      lastCall = now;
+      fn.apply(this, args);
+    } else if (!pending) {
+      pending = true;
+      setTimeout(() => {
+        pending = false;
+        lastCall = Date.now();
+        fn.apply(this, args);
+      }, limitMs - (now - lastCall));
+    }
+  };
+}
+
+function debounce(fn, waitMs) {
+  let timer = null;
+  return function (...args) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn.apply(this, args);
+    }, waitMs);
+  };
 }
 
 function parseSeatName(name) {
@@ -170,14 +250,22 @@ function setStatus(stage, message) {
 
 socket.on('status', data => {
   setStatus(data.stage, `${data.account ? `[${data.account}] ` : ''}${data.message}`);
-  if (data.account) updateAccountRow(data.account, data.stage, data);
+  if (data.account) {
+    updateAccountRow(data.account, data.stage, data);
+    scheduleUpdateTransferSelects();
+  }
   if (['idle', 'error', 'payment-ready'].includes(data.stage) && !data.account) {
     setLoading(false);
   }
+  // NOTE: hold-token extension is intentionally driven by the backend based on
+  // the booking-page countdown timer. Do NOT trigger extension here on queue
+  // pass or seat-selection events, because the token may not have any held
+  // seats yet and premature renewal wastes time / may invalidate the token.
 });
 
 socket.on('account-update', data => {
   updateAccountRow(data.account, data.stage, data);
+  scheduleUpdateTransferSelects();
 });
 
 socket.on('queue-stats', stats => {
@@ -203,6 +291,171 @@ socket.on('pair-cycle-event', data => {
   refreshPairCyclesStatus();
 });
 
+socket.on('session-harvested', data => {
+  log(`💾 تم حفظ جلسة ${data.username} تلقائياً (${data.cookiesCount || 0} كوكيز)`);
+  refreshCachedSessionsCount();
+  if (els.cachedSessionsList && !els.cachedSessionsList.classList.contains('hidden')) {
+    showCachedSessions();
+  }
+});
+
+// Real-time chart synchronization via backend events.
+socket.on('seat-held', data => {
+  const acc = accounts.find(a => a.username === data.account);
+  if (acc) {
+    acc.seats = Array.from(new Set([...(acc.seats || []), ...(data.seats || [])]));
+    updateHeldCount();
+    throttledRenderAccounts();
+  }
+  log(`${data.account}: مسك ${(data.seats || []).join(', ')}`);
+});
+
+socket.on('seat-released', data => {
+  const acc = accounts.find(a => a.username === data.account);
+  if (acc) {
+    const released = new Set((data.seats || []).map(s => String(s).trim().toUpperCase()));
+    acc.seats = (acc.seats || []).filter(s => !released.has(String(s).trim().toUpperCase()));
+    updateHeldCount();
+    throttledRenderAccounts();
+  }
+  log(`${data.account}: فك ${(data.seats || []).join(', ')}`);
+});
+
+socket.on('transfer-done', data => {
+  log(`✅ تم نقل ${data.totalTransferred || 0} مقعد`);
+  updateHeldCount();
+  throttledRenderAccounts();
+  scheduleUpdateTransferSelects();
+});
+
+socket.on('transfer-plan-built', data => {
+  updateTransferProgress('plan-built', {
+    totalDestinations: data.destinations?.length || 0,
+    totalSeats: (data.destinations || []).reduce((s, d) => s + (d.count || 0), 0),
+  });
+  initTransferDestinationStatuses(data.destinations || []);
+});
+
+socket.on('transfer-distribution-preview', data => {
+  renderTransferDistributionPreview(data.destinations || []);
+  log(`📦 توزيع المقاعد: ${data.totalSeats || 0} مقعد على ${(data.destinations || []).length} وجهة`);
+  // Refresh seats for each destination from the distribution preview.
+  for (const d of data.destinations || []) {
+    updateTransferDestinationStatus(d.username, 'planned', { seats: d.seats || d.assignedSeats || [] });
+  }
+});
+
+socket.on('destination-preparing', data => {
+  // Keep the running totals; the plan-built event already set them.
+  if (data.totalDestinations && transferProgress.totalDestinations === 0) {
+    transferProgress.totalDestinations = data.totalDestinations;
+  }
+  updateTransferProgress('destination-preparing', {
+    totalDestinations: data.totalDestinations || transferProgress.totalDestinations,
+    currentIndex: data.currentIndex || 1,
+  });
+  if (data.account) updateTransferDestinationStatus(data.account, 'preparing');
+});
+
+socket.on('destination-ready', data => {
+  updateTransferProgress('destination-ready');
+  if (data.account) updateTransferDestinationStatus(data.account, 'ready');
+});
+
+socket.on('destination-prepare-failed', data => {
+  if (data.account) updateTransferDestinationStatus(data.account, 'failed', { error: data.error || 'فشل التحضير' });
+});
+
+socket.on('transfer-batch-start', data => {
+  if (data.to) updateTransferDestinationStatus(data.to, 'transferring');
+});
+
+socket.on('transfer-batch-complete', data => {
+  updateTransferProgress('batch-complete', { transferred: data.held?.length || 0 });
+  if (data.to) {
+    updateTransferDestinationStatus(data.to, 'transferring', {
+      transferred: (data.held || []).length,
+      missing: (data.missing || []).length,
+    });
+  }
+});
+
+socket.on('transfer-done', data => {
+  updateTransferProgress('done', { totalTransferred: data.totalTransferred });
+  log(`✅ تم نقل ${data.totalTransferred || 0} مقعد`);
+  updateHeldCount();
+  throttledRenderAccounts();
+  scheduleUpdateTransferSelects();
+  // Mark all still-active destinations as complete/failed based on whether seats arrived.
+  for (const [username, status] of transferDestinationStatuses.entries()) {
+    if (status.state === 'transferring' || status.state === 'ready') {
+      updateTransferDestinationStatus(username, status.missing > 0 ? 'failed' : 'complete');
+    }
+  }
+});
+
+socket.on('transfer-failed', data => {
+  updateTransferProgress('failed');
+  log(`❌ فشل النقل: ${data.message || data.error || 'خطأ غير معروف'}`, 'error');
+  for (const username of transferDestinationStatuses.keys()) {
+    updateTransferDestinationStatus(username, 'failed', { error: data.error || data.message || 'فشل النقل' });
+  }
+  resetTransferProgress();
+});
+
+// Listen to seats.io postMessage events if the chart iframe is present in this page.
+class SeatChartSync {
+  constructor() {
+    this.heldSeats = new Map();
+    this.bookedSeats = new Set();
+    this.listenForChartEvents();
+  }
+
+  listenForChartEvents() {
+    window.addEventListener('message', (event) => {
+      const origin = event.origin || '';
+      if (origin.includes('seats.io') || origin.includes('seatcloud.com')) {
+        this.handleSeatEvent(event.data);
+      }
+    });
+  }
+
+  handleSeatEvent(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'objectsSelected' || data.type === 'hold') {
+      this.updateUI(data.account || 'chart', data.objects || [], 'held');
+    } else if (data.type === 'objectsDeselected' || data.type === 'release') {
+      this.updateUI(data.account || 'chart', data.objects || [], 'released');
+    } else if (data.type === 'bookingCompleted') {
+      for (const seat of data.objects || []) this.bookedSeats.add(seat);
+      updateHeldCount();
+    }
+  }
+
+  updateUI(account, seatIds, action) {
+    seatIds = Array.isArray(seatIds) ? seatIds : [];
+    if (action === 'held') {
+      this.heldSeats.set(account, seatIds);
+    } else if (action === 'released') {
+      const current = this.heldSeats.get(account) || [];
+      const removed = new Set(seatIds.map(s => String(s).trim().toUpperCase()));
+      this.heldSeats.set(account, current.filter(s => !removed.has(String(s).trim().toUpperCase())));
+    }
+    // Sync the account row in the UI if this event belongs to a loaded account.
+    const acc = accounts.find(a => a.username === account);
+    if (acc) {
+      acc.seats = seatIds;
+      updateHeldCount();
+      throttledRenderAccounts();
+    } else {
+      updateHeldCount();
+    }
+    log(`شارت: ${account} ${action === 'held' ? 'مسك' : 'فك'} ${seatIds.join(', ')}`);
+  }
+}
+
+const seatChartSync = new SeatChartSync();
+
 function setLoading(loading) {
   running = loading;
   if (loading) window.__lastLoadingStart = Date.now();
@@ -210,6 +463,8 @@ function setLoading(loading) {
   els.refreshAvailabilityBtn.disabled = loading;
   els.startBookingBtn.disabled = loading || getSelectedSections().length === 0 || !accounts.some(a => a.selected);
   els.accountsFile.disabled = loading;
+  if (els.transferSeatsBtn) els.transferSeatsBtn.disabled = loading;
+  if (els.startPairCyclingBtn) els.startPairCyclingBtn.disabled = loading;
   updateButtonStates();
 }
 
@@ -233,6 +488,31 @@ function updateButtonStates() {
 }
 
 // Sections / availability
+function detectEventType(url) {
+  if (url.includes('/music-events/')) return 'MUSIC';
+  if (url.includes('/sports-event/')) return 'SPORTS';
+  if (url.includes('/theater/')) return 'THEATER';
+  return 'GENERAL';
+}
+
+function applyDetectedMaxTickets(maxTickets) {
+  detectedMaxTickets = Math.max(1, Math.min(parseInt(maxTickets, 10) || 30, 30));
+  if (els.detectedMaxTicketsValue) els.detectedMaxTicketsValue.textContent = detectedMaxTickets;
+  if (els.detectedMaxTicketsHint) els.detectedMaxTicketsHint.classList.remove('hidden');
+
+  const autoDetect = els.autoDetectMaxTickets && els.autoDetectMaxTickets.checked;
+  if (autoDetect) {
+    // Update all accounts' ticket counts to the detected limit.
+    accounts.forEach(a => { a.ticketCount = detectedMaxTickets; });
+    eventMaxPerOrder = detectedMaxTickets;
+    log(`اكتشاف تلقائي: نوع الفعالية ${detectedEventType}، الحد الأقصى للتذاكر ${detectedMaxTickets}. تم تحديث كل الحسابات.`);
+  } else {
+    eventMaxPerOrder = detectedMaxTickets;
+    log(`اكتشاف تلقائي: نوع الفعالية ${detectedEventType}، الحد الأقصى للتذاكر ${detectedMaxTickets} (لم يُحدّث الحسابات لأن الاكتشاف التلقائي معطل).`);
+  }
+  renderAccounts();
+}
+
 async function loadSections() {
   const url = els.eventUrl.value.trim();
   if (!url) return alert('أدخل رابط الفعالية');
@@ -252,7 +532,8 @@ async function loadSections() {
     }
 
     eventTitle = json.event || '';
-    eventMaxPerOrder = 30; // user requested: override platform limits to 30
+    detectedEventType = detectEventType(url);
+    eventMaxPerOrder = 30;
     showEventInfo(json.event, json.chartSections, queueStatus);
     const previousSelected = new Set(getSelectedSections());
     sectionsData = (json.chartSections || []).map(s => ({
@@ -271,7 +552,14 @@ async function loadSections() {
       : null;
     renderTeams();
 
-    log(`تم تحميل ${sectionsData.length} أقسام لـ "${eventTitle}". الحد الأقصى للطلب الواحد: ${eventMaxPerOrder} تذاكر.`);
+    // Auto-detect max tickets per user from event detail.
+    if (typeof json.maxTicketsPerUser === 'number') {
+      applyDetectedMaxTickets(json.maxTicketsPerUser);
+    } else {
+      applyDetectedMaxTickets(30);
+    }
+
+    log(`تم تحميل ${sectionsData.length} أقسام لـ "${eventTitle}". نوع الفعالية: ${detectedEventType}.`);
     if (queueStatus && queueStatus.success) {
       log(`حالة الطابور: ${queueStatus.queued ? 'فعالية في الطابور' : 'حجز مباشر'} (ثقة: ${queueStatus.confidence || 'low'})`);
     }
@@ -303,9 +591,14 @@ async function checkQueueOnly() {
 
 function updateQueueBadge(queueStatus) {
   if (!els.eventQueueBadge) return;
-  // Badge is intentionally hidden per user request; keep it hidden.
-  els.eventQueueBadge.className = 'event-badge hidden';
-  els.eventQueueBadge.textContent = '';
+  if (!queueStatus) {
+    els.eventQueueBadge.className = 'event-badge hidden';
+    els.eventQueueBadge.textContent = '';
+    return;
+  }
+  const queued = !!queueStatus.queued;
+  els.eventQueueBadge.className = `event-badge ${queued ? 'queued' : 'open'}`;
+  els.eventQueueBadge.textContent = queued ? 'في الطابور' : 'حجز مباشر';
 }
 
 function getSpeedSettings() {
@@ -482,6 +775,7 @@ function upsertAccount(username, password, selected = true) {
     });
   }
   renderAccounts();
+  scheduleUpdateTransferSelects();
 }
 
 function upsertHoldTokenAccount(holdToken, loginEmail, loginPassword, extras = {}, selected = true) {
@@ -518,6 +812,7 @@ function upsertHoldTokenAccount(holdToken, loginEmail, loginPassword, extras = {
     });
   }
   renderAccounts();
+  scheduleUpdateTransferSelects();
 }
 
 // Kept for backwards compatibility; new code should use upsertAccount.
@@ -709,6 +1004,10 @@ function renderAccounts() {
     const typeBadge = isHoldToken ? '<span class="type-badge holdtoken-badge">Hold Token</span>' : '';
     const loginHint = isHoldToken && acc.loginEmail ? `<div class="account-login-hint">تسجيل الدخول: ${escapeHtml(acc.loginEmail)}</div>` : '';
     const proxyBadge = acc.proxy ? `<span class="proxy-badge" title="${escapeHtml(acc.proxy)}">🌐 ${escapeHtml(acc.proxy.split('://')[1] || acc.proxy)}</span>` : '';
+    const proxyOptions = `<select data-action="proxy-mode">
+          <option value="direct" ${acc.useProxy ? '' : 'selected'}>⛔ مباشر</option>
+          <option value="proxy" ${acc.useProxy ? 'selected' : ''}>🌐 بروكسي</option>
+        </select>`;
     row.innerHTML = `
       <input type="checkbox" ${acc.selected ? 'checked' : ''}>
       <div class="account-info">
@@ -721,18 +1020,15 @@ function renderAccounts() {
       </div>
       <div class="account-actions">
         <label class="proxy-toggle">
-          <select data-action="proxy-mode">
-            <option value="direct" ${acc.useProxy ? '' : 'selected'}>⛔ مباشر</option>
-            <option value="proxy" ${acc.useProxy ? 'selected' : ''}>🌐 بروكسي</option>
-          </select>
+          ${proxyOptions}
         </label>
         <label class="ticket-count-label" title="عدد التذاكر المطلوب لهذا الحساب (حد أقصى 30)">
           🎫
           <input type="number" class="ticket-count-input" data-action="ticket-count" value="${acc.ticketCount || 30}" min="1" max="30" />
         </label>
-        <button class="btn-proceed" data-action="proceed" ${!isHolding ? 'disabled' : ''}>دفع</button>
-        <button class="btn-release" data-action="release" ${!isHolding ? 'disabled' : ''}>فك الكل</button>
-        <button class="btn-stop" data-action="stop" ${!canStop ? 'disabled' : ''}>إيقاف</button>
+        <button class="btn-proceed" data-action="proceed">دفع</button>
+        <button class="btn-release" data-action="release">فك الكل</button>
+        <button class="btn-stop" data-action="stop">إيقاف</button>
         <button class="btn-delete" data-action="delete">🗑️ حذف</button>
       </div>
     `;
@@ -780,6 +1076,9 @@ function renderAccounts() {
   updateButtonStates();
   updateHeldCount();
 }
+
+// Throttle full account-list re-renders so rapid socket updates do not freeze the UI.
+const throttledRenderAccounts = throttle(renderAccounts, 300);
 
 function stageLabel(stage, position = null) {
   const map = {
@@ -837,11 +1136,19 @@ function stageLabel(stage, position = null) {
 function updateAccountRow(username, stage, data) {
   const acc = accounts.find(a => a.username === username);
   if (!acc) return;
+  const prevSeatCount = acc.seats?.length || 0;
   acc.stage = stage;
   if (data.seats && Array.isArray(data.seats)) acc.seats = data.seats;
   if (data.verifiedSeats && Array.isArray(data.verifiedSeats)) acc.seats = data.verifiedSeats;
   if (data.proxy) acc.proxy = data.proxy;
   if (data.proxyMode) acc.proxyMode = data.proxyMode;
+
+  // Sync chart counters immediately when seat lists change.
+  const newSeatCount = acc.seats?.length || 0;
+  if (newSeatCount !== prevSeatCount) {
+    updateHeldCount();
+    scheduleUpdateTransferSelects();
+  }
 
   // Sniper indicator: active while monitoring/sniping, off when idle/error/stopped.
   if (stage === 'seats-monitoring' || stage === 'seats-sniping') {
@@ -872,7 +1179,7 @@ function updateAccountRow(username, stage, data) {
   if (stage === 'queue-position' || stage === 'queue-waiting' || stage === 'queue-timer') {
     updateAccountRowDom(acc);
   } else {
-    renderAccounts();
+    throttledRenderAccounts();
   }
 }
 
@@ -932,6 +1239,33 @@ els.removeAllAccountsBtn.addEventListener('click', () => {
 
 els.loadAccountsBtn.addEventListener('click', loadAccountsFromServer);
 els.saveAccountsBtn.addEventListener('click', saveAccountsToServer);
+
+if (els.setAllProxyBtn) {
+  els.setAllProxyBtn.addEventListener('click', () => {
+    accounts.forEach(a => { a.useProxy = true; });
+    renderAccounts();
+    log('🌐 تم تفعيل البروكسي لكل الحسابات');
+  });
+}
+if (els.setAllDirectBtn) {
+  els.setAllDirectBtn.addEventListener('click', () => {
+    accounts.forEach(a => { a.useProxy = false; });
+    renderAccounts();
+    log('⛔ تم تفعيل الاتصال المباشر لكل الحسابات');
+  });
+}
+if (els.applyBulkTicketCountBtn && els.bulkTicketCount) {
+  els.applyBulkTicketCountBtn.addEventListener('click', () => {
+    const count = parseInt(els.bulkTicketCount.value, 10);
+    if (isNaN(count) || count < 1 || count > 30) {
+      log('⚠️ عدد التذاكر يجب أن يكون بين 1 و 30', 'warning');
+      return;
+    }
+    accounts.forEach(a => { a.ticketCount = count; });
+    renderAccounts();
+    log(`🎫 تم تطبيق ${count} تذكرة على كل الحسابات`);
+  });
+}
 
 function proxyToString(p) {
   let server = p.server || '';
@@ -1292,6 +1626,7 @@ els.testAllProxiesBtn.addEventListener('click', async () => {
 function deleteAccount(username) {
   accounts = accounts.filter(a => a.username !== username);
   renderAccounts();
+  scheduleUpdateTransferSelects();
   log(`تم حذف الحساب: ${username}`);
 }
 
@@ -1372,9 +1707,9 @@ els.startBookingBtn.addEventListener('click', async () => {
 els.stopBookingBtn.addEventListener('click', async () => {
   try {
     await fetch('/api/stop-booking', { method: 'POST' });
-    log('تم إرسال إشارة إيقاف الكل');
+    log('⏸️ تم إيقاف العمليات والسنايبر؛ المقاعد الممسوكة محتفظ بها في صفحة الحجز');
   } catch (err) {
-    log(`فشل إرسال إيقاف الكل: ${err.message}`, 'error');
+    log(`فشل إيقاف الكل: ${err.message}`, 'error');
   }
   // Force-reset the UI loading state so the start button becomes clickable again
   // even if socket events were missed.
@@ -1385,18 +1720,804 @@ els.stopBookingBtn.addEventListener('click', async () => {
   }, 1500);
 });
 
+if (els.stopBookingHardBtn) {
+  els.stopBookingHardBtn.addEventListener('click', async () => {
+    try {
+      await fetch('/api/stop-booking-hard', { method: 'POST' });
+      log('🛑 تم إيقاف كل الجلسات وإغلاق المتصفحات');
+    } catch (err) {
+      log(`فشل الإيقاف الكامل: ${err.message}`, 'error');
+    }
+    setTimeout(() => {
+      running = false;
+      setLoading(false);
+    }, 1000);
+  });
+}
+
+async function extendAllTokens() {
+  try {
+    setLoading(true);
+    const res = await fetch('/api/extend-all', { method: 'POST' });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || 'Unknown error');
+    log(`تم تمديد ${json.count}/${json.total} توكن نشط`);
+  } catch (err) {
+    log(`فشل تمديد التوكنز: ${err.message}`, 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function refreshAllAuthTokens() {
+  let successCount = 0;
+  let failCount = 0;
+  const activeAccounts = accounts.filter(a => a.stage && a.stage !== 'idle' && a.stage !== 'error');
+  if (activeAccounts.length === 0) {
+    log('مفيش حسابات نشطة لتجديد الـ JWT');
+    return;
+  }
+  setLoading(true);
+  for (const acc of activeAccounts) {
+    try {
+      const res = await fetch('/api/refresh-auth-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: acc.username }),
+      });
+      const json = await res.json();
+      if (json.success && json.refreshed) successCount++;
+      else failCount++;
+    } catch (err) {
+      failCount++;
+    }
+  }
+  setLoading(false);
+  log(`تجديد JWT: ${successCount} نجح، ${failCount} فشل من ${activeAccounts.length}`);
+}
+
+// Token management is now automatic; legacy manual buttons removed.
+// Automatic refresh loops are started at the bottom of this file.
+
+class SessionManager {
+  constructor() {
+    this.sessionCheckInterval = 5 * 60 * 1000; // 5 minutes
+    this.holdTokenTimestamps = new Map(); // username -> { createdAt, expiresAt }
+    this.startMonitoring();
+  }
+
+  startMonitoring() {
+    // Initial checks after a short delay so the UI is ready.
+    setTimeout(() => this.checkAndRenew(), 5000);
+    setInterval(() => this.checkAndRenew(), this.sessionCheckInterval);
+    // NOTE: automatic hold-token renewal is intentionally driven by the backend
+    // based on the booking-page countdown timer. The frontend no longer renews
+    // tokens blindly every 8 minutes or based on a computed expiry timestamp.
+  }
+
+  async checkAndRenew() {
+    if (accounts.length === 0) return;
+    await this.refreshAuthTokens();
+  }
+
+  async refreshAuthTokens() {
+    // Only refresh accounts that have an active/paused/holding session.
+    const targets = accounts.filter(a => a.stage && a.stage !== 'idle' && a.stage !== 'error');
+    if (targets.length === 0) return;
+    let successCount = 0;
+    let failCount = 0;
+    for (const acc of targets) {
+      try {
+        const res = await fetch('/api/refresh-auth-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: acc.username }),
+        });
+        const json = await res.json();
+        if (json.success && json.refreshed) successCount++;
+        else failCount++;
+      } catch (err) {
+        failCount++;
+      }
+    }
+    if (successCount || failCount) {
+      log(`تجديد JWT تلقائي: ${successCount} نجح، ${failCount} فشل من ${targets.length}`);
+    }
+  }
+
+  async renewHoldTokens() {
+    // Extend all active hold tokens in one call.
+    if (accounts.length === 0) return;
+    try {
+      const res = await fetch('/api/extend-all', { method: 'POST' });
+      const json = await res.json();
+      if (json.success && json.count > 0) {
+        log(`تمديد تلقائي للتوكنز: ${json.count}/${json.total} تم تمديده`);
+      }
+      // Refresh local expiry cache from results.
+      for (const r of json.results || []) {
+        if (r.success) this.updateExpiry(r.username, 15);
+      }
+    } catch (err) {
+      // Silent failure; do not spam logs.
+    }
+  }
+
+  updateExpiry(username, ttlMinutes = 15) {
+    const now = Date.now();
+    this.holdTokenTimestamps.set(username, {
+      createdAt: now,
+      expiresAt: now + ttlMinutes * 60 * 1000,
+    });
+  }
+
+  async monitorHoldTokenExpiry() {
+    // Fetch session info for active accounts and renew if expiry is near.
+    const targets = accounts.filter(a => a.stage && a.stage !== 'idle' && a.stage !== 'error');
+    const toRenew = [];
+    for (const acc of targets) {
+      try {
+        const res = await fetch(`/api/session-info/${encodeURIComponent(acc.username)}`);
+        const json = await res.json();
+        if (!json.success) continue;
+        if (json.holdTokenCreatedAt && json.holdTokenExpiresAt) {
+          this.holdTokenTimestamps.set(acc.username, {
+            createdAt: json.holdTokenCreatedAt,
+            expiresAt: json.holdTokenExpiresAt,
+          });
+          const expiresIn = json.holdTokenExpiresAt - Date.now();
+          if (expiresIn < this.renewalBufferMs) {
+            toRenew.push(acc.username);
+          }
+        }
+      } catch (err) {
+        // Ignore; next cycle will retry.
+      }
+    }
+    if (toRenew.length > 0) {
+      log(`اكتشاف انتهاء قريب للـ holdToken لـ ${toRenew.length} حساب؛ جاري التمديد...`);
+      for (const username of toRenew) {
+        try {
+          const res = await fetch('/api/extend-token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username }),
+          });
+          const json = await res.json();
+          if (json.success) {
+            this.updateExpiry(username, 15);
+            log(`تم تمديد holdToken لـ ${username}`);
+          }
+        } catch (err) {
+          log(`فشل تمديد holdToken لـ ${username}: ${err.message}`, 'error');
+        }
+      }
+    }
+  }
+
+  async onQueuePass() {
+    await this.renewHoldTokens();
+  }
+
+  async onSeatSelection() {
+    // Seat selection usually generates/renews hold tokens; extend immediately.
+    await this.renewHoldTokens();
+  }
+}
+
+const sessionManager = new SessionManager();
+
+function getSelectedTransferUsernames(listEl) {
+  if (!listEl) return [];
+  return Array.from(listEl.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value);
+}
+
+function renderTransferList(listEl, accountList, name, preserveChecked = true) {
+  if (!listEl) return;
+  const previouslyChecked = preserveChecked
+    ? new Set(Array.from(listEl.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value))
+    : new Set();
+  listEl.innerHTML = accountList.map(a => {
+    const label = `${escapeHtml(a.username)} (${a.stage || 'idle'})`;
+    const checked = previouslyChecked.has(a.username) ? 'checked' : '';
+    const proxySelected = a.useProxy === true ? 'selected' : '';
+    const directSelected = a.useProxy !== true ? 'selected' : '';
+    return `<label class="transfer-account-item" data-username="${escapeHtml(a.username)}">
+      <input type="checkbox" name="${name}" value="${escapeHtml(a.username)}" ${checked} />
+      <span>${label}</span>
+      <select class="transfer-proxy-mode tiny" data-action="proxy-mode" title="بروكسي أو مباشر">
+        <option value="direct" ${directSelected}>⛔ مباشر</option>
+        <option value="proxy" ${proxySelected}>🌐 بروكسي</option>
+      </select>
+      <input type="number" class="transfer-ticket-count tiny" data-action="ticket-count" value="${a.transferTicketCount || a.ticketCount || 5}" min="1" max="30" title="عدد التذاكر" style="width:50px;padding:2px;">
+    </label>`;
+  }).join('');
+}
+
+function updateTransferSelects() {
+  if (!els.transferFromList || !els.transferToList) return;
+
+  // Read current selections before re-rendering.
+  const previouslyCheckedSources = new Set(
+    Array.from(els.transferFromList.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value)
+  );
+  const previouslyCheckedDests = new Set(
+    Array.from(els.transferToList.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value)
+  );
+
+  // Destinations selected as sources must be removed from destinations.
+  // Sources selected as destinations must be removed from sources.
+  const selectedSources = new Set([...previouslyCheckedSources].filter(u => !previouslyCheckedDests.has(u)));
+  const selectedDests = new Set([...previouslyCheckedDests].filter(u => !previouslyCheckedSources.has(u)));
+
+  // Sources: all accounts except those selected as destinations.
+  const sourceAccounts = accounts.filter(a => !selectedDests.has(a.username));
+  renderTransferList(els.transferFromList, sourceAccounts, 'transferFrom', false);
+  els.transferFromList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.checked = selectedSources.has(cb.value);
+  });
+
+  // Destinations: all accounts except those selected as sources.
+  const destAccounts = accounts.filter(a => !selectedSources.has(a.username));
+  renderTransferList(els.transferToList, destAccounts, 'transferTo', false);
+  els.transferToList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.checked = selectedDests.has(cb.value);
+  });
+
+  // Re-attach listeners so checking/unchecking refreshes both lists.
+  els.transferFromList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('change', () => scheduleUpdateTransferSelects());
+  });
+  els.transferToList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('change', () => scheduleUpdateTransferSelects());
+  });
+
+  attachTransferRowListeners();
+}
+
+// Debounce transfer-list re-renders so the user can interact with checkboxes during rapid updates.
+const scheduleUpdateTransferSelects = debounce(updateTransferSelects, 500);
+
+function setAllTransferChecked(listEl, checked) {
+  if (!listEl) return;
+  listEl.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = checked);
+}
+
+function attachTransferRowListeners() {
+  // Per-row proxy mode and ticket count in transfer lists.
+  [els.transferFromList, els.transferToList].forEach(listEl => {
+    if (!listEl) return;
+    listEl.querySelectorAll('.transfer-proxy-mode').forEach(sel => {
+      sel.addEventListener('change', (e) => {
+        const username = e.target.closest('.transfer-account-item')?.dataset.username;
+        const acc = accounts.find(a => a.username === username);
+        if (acc) {
+          acc.useProxy = e.target.value === 'proxy';
+          updateAccountRow(acc);
+        }
+      });
+    });
+    listEl.querySelectorAll('.transfer-ticket-count').forEach(inp => {
+      inp.addEventListener('change', (e) => {
+        const username = e.target.closest('.transfer-account-item')?.dataset.username;
+        const acc = accounts.find(a => a.username === username);
+        if (acc) {
+          acc.transferTicketCount = Math.max(1, Math.min(30, parseInt(e.target.value, 10) || 5));
+          updateAccountRow(acc);
+        }
+      });
+    });
+  });
+}
+
+function setAllTransferProxyMode(useProxy) {
+  for (const acc of accounts) {
+    acc.useProxy = useProxy;
+  }
+  updateTransferSelects();
+  attachTransferRowListeners();
+  for (const acc of accounts) updateAccountRow(acc);
+  log(useProxy ? '🌐 كل الحسابات اتحولت لبروكسي' : '⛔ كل الحسابات اتحولت لمباشر');
+}
+
+function applyBulkTransferTicketCount() {
+  const count = Math.max(1, Math.min(30, parseInt(els.bulkTransferTicketCount?.value, 10) || 5));
+  for (const acc of accounts) {
+    acc.transferTicketCount = count;
+  }
+  updateTransferSelects();
+  attachTransferRowListeners();
+  log(`🎫 عدد التذاكر لكل الحسابات اتحط على ${count}`);
+}
+
+function resetTransferProgress() {
+  transferProgress = {
+    active: false,
+    totalDestinations: 0,
+    preparedDestinations: 0,
+    totalSeats: 0,
+    transferredSeats: 0,
+    abortController: null,
+  };
+  resetTransferDestinationStatuses();
+  if (els.transferProgressWrapper) els.transferProgressWrapper.classList.add('hidden');
+  if (els.transferProgressFill) els.transferProgressFill.style.width = '0%';
+  if (els.cancelTransferBtn) els.cancelTransferBtn.classList.add('hidden');
+  if (els.transferDistributionPreview) els.transferDistributionPreview.classList.add('hidden');
+  if (els.transferDistributionList) els.transferDistributionList.innerHTML = '';
+}
+
+function renderTransferDistributionPreview(destinations) {
+  if (!els.transferDistributionPreview || !els.transferDistributionList) return;
+  if (!destinations.length) {
+    els.transferDistributionPreview.classList.add('hidden');
+    return;
+  }
+  els.transferDistributionList.innerHTML = destinations.map(d => {
+    const seats = (d.seats || []).map(s => {
+      const p = parseSeatName(s);
+      return p ? `${p.section} ${p.row}-${p.seat}` : s;
+    }).join('، ');
+    return `<div class="transfer-distribution-item">
+      <div class="transfer-distribution-user">${escapeHtml(d.username)}</div>
+      <div class="transfer-distribution-seats">${escapeHtml(d.seats?.length + '')} مقعد: ${escapeHtml(seats)}</div>
+    </div>`;
+  }).join('');
+  els.transferDistributionPreview.classList.remove('hidden');
+}
+
+function updateTransferProgress(stage, data = {}) {
+  if (!transferProgress.active) return;
+  if (stage === 'plan-built') {
+    transferProgress.totalDestinations = data.totalDestinations || transferProgress.totalDestinations;
+    transferProgress.totalSeats = data.totalSeats || transferProgress.totalSeats;
+    transferProgress.preparedDestinations = 0;
+    transferProgress.transferredSeats = 0;
+  } else if (stage === 'destination-ready') {
+    transferProgress.preparedDestinations = Math.min(transferProgress.preparedDestinations + 1, transferProgress.totalDestinations);
+  } else if (stage === 'batch-complete') {
+    transferProgress.transferredSeats = Math.min((transferProgress.transferredSeats || 0) + (data.transferred || 0), transferProgress.totalSeats);
+  } else if (stage === 'done' || stage === 'failed') {
+    transferProgress.transferredSeats = data.totalTransferred !== undefined ? data.totalTransferred : transferProgress.transferredSeats;
+  }
+
+  const pct = transferProgress.totalSeats > 0
+    ? Math.round((transferProgress.transferredSeats / transferProgress.totalSeats) * 100)
+    : (transferProgress.totalDestinations > 0
+      ? Math.round((transferProgress.preparedDestinations / transferProgress.totalDestinations) * 100)
+      : 0);
+
+  if (els.transferProgressWrapper) els.transferProgressWrapper.classList.remove('hidden');
+  if (els.transferProgressFill) els.transferProgressFill.style.width = `${pct}%`;
+  if (els.transferProgressCount) els.transferProgressCount.textContent = `${transferProgress.transferredSeats} / ${transferProgress.totalSeats}`;
+
+  const labels = {
+    'plan-built': 'جاري بناء خطة النقل...',
+    'trying-v3': '⚡ جاري النقل عبر محرك v3...',
+    'trying-v2': '🔄 جاري النقل عبر محرك v2 الاحتياطي...',
+    'destination-preparing': `جاري فتح المتصفح للوجهة ${data.currentIndex || 1}/${data.totalDestinations || transferProgress.totalDestinations}...`,
+    'destination-ready': `جاهز ${transferProgress.preparedDestinations}/${transferProgress.totalDestinations} وجهة...`,
+    'batch-complete': `تم نقل ${transferProgress.transferredSeats}/${transferProgress.totalSeats} مقعد...`,
+    'done': `اكتمل: ${transferProgress.transferredSeats}/${transferProgress.totalSeats} مقعد`,
+    'failed': 'فشل النقل',
+  };
+  if (els.transferProgressText) els.transferProgressText.textContent = labels[stage] || 'جاري النقل...';
+}
+
+function resetTransferDestinationStatuses() {
+  transferDestinationStatuses.clear();
+  if (els.transferDestinationStatusList) {
+    els.transferDestinationStatusList.classList.add('hidden');
+    els.transferDestinationStatusList.innerHTML = '';
+  }
+}
+
+function initTransferDestinationStatuses(destinations) {
+  transferDestinationStatuses.clear();
+  for (const d of destinations) {
+    transferDestinationStatuses.set(d.username, {
+      state: 'planned',
+      seats: d.seats || d.assignedSeats || [],
+      transferred: 0,
+      missing: 0,
+      error: null,
+    });
+  }
+  renderTransferDestinationStatusList();
+}
+
+function updateTransferDestinationStatus(username, state, data = {}) {
+  const status = transferDestinationStatuses.get(username);
+  if (!status) return;
+  status.state = state;
+  if (data.seats !== undefined) status.seats = data.seats;
+  if (data.transferred !== undefined) status.transferred = data.transferred;
+  if (data.missing !== undefined) status.missing = data.missing;
+  if (data.error !== undefined) status.error = data.error;
+  renderTransferDestinationStatusList();
+}
+
+function renderTransferDestinationStatusList() {
+  if (!els.transferDestinationStatusList) return;
+  if (transferDestinationStatuses.size === 0) {
+    els.transferDestinationStatusList.classList.add('hidden');
+    return;
+  }
+
+  const stateLabels = {
+    planned: '📋 مخطط',
+    preparing: '⏳ جاري التحضير',
+    ready: '✅ جاهز',
+    transferring: '🔄 جاري النقل',
+    complete: '✅ اكتمل',
+    failed: '❌ فشل',
+  };
+
+  const items = Array.from(transferDestinationStatuses.entries()).map(([username, status]) => {
+    const seatChips = formatSeatList(status.seats || []);
+    const resultLine = status.state === 'complete' || status.state === 'failed'
+      ? `<div class="destination-status-result">نُقل ${status.transferred || 0} · فُقد ${status.missing || 0}</div>`
+      : '';
+    const errorLine = status.error
+      ? `<div class="destination-status-error">${escapeHtml(status.error)}</div>`
+      : '';
+    return `<div class="destination-status-item destination-status-${status.state}">
+      <div class="destination-status-header">
+        <span class="destination-status-user">${escapeHtml(username)}</span>
+        <span class="destination-status-state">${stateLabels[status.state] || status.state}</span>
+      </div>
+      <div class="destination-status-seats">${seatChips}</div>
+      ${resultLine}
+      ${errorLine}
+    </div>`;
+  }).join('');
+
+  els.transferDestinationStatusList.innerHTML = `<h4>📊 حالة الوجهات</h4>${items}`;
+  els.transferDestinationStatusList.classList.remove('hidden');
+}
+
+async function harvestSelectedSessions() {
+  const selectedSources = getSelectedTransferUsernames(els.transferFromList);
+  const selectedDests = getSelectedTransferUsernames(els.transferToList);
+  const selected = [...new Set([...selectedSources, ...selectedDests])];
+  if (selected.length === 0) return alert('اختر حساباً واحداً على الأقل من المصادر أو الوجهات');
+  for (const username of selected) {
+    try {
+      setLoading(true);
+      const res = await fetch('/api/harvest-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        log(`✅ تم استخراج جلسة ${username}: ${json.cookiesCount} كوكيز, ${json.localStorageCount} LS, ${json.sessionStorageCount} SS`);
+      } else {
+        log(`❌ فشل استخراج جلسة ${username}: ${json.error}`, 'error');
+      }
+    } catch (err) {
+      log(`❌ خطأ في استخراج جلسة ${username}: ${err.message}`, 'error');
+    }
+  }
+  setLoading(false);
+}
+
+async function deleteSession(username) {
+  if (!confirm(`هل تريد حذف الجلسة المحفوظة لـ ${username}؟`)) return;
+  try {
+    const res = await fetch(`/api/session/${encodeURIComponent(username)}`, { method: 'DELETE' });
+    if (res.ok) {
+      log(`🗑️ تم حذف جلسة ${username}`);
+      showCachedSessions();
+      refreshCachedSessionsCount();
+    } else {
+      const json = await res.json().catch(() => ({}));
+      log(`❌ فشل حذف جلسة ${username}: ${json.error || res.statusText}`, 'error');
+    }
+  } catch (err) {
+    log(`❌ خطأ في حذف جلسة ${username}: ${err.message}`, 'error');
+  }
+}
+
+async function refreshCachedSessionsCount() {
+  if (!els.cachedSessionsCount) return;
+  try {
+    const res = await fetch('/api/list-sessions');
+    const sessions = await res.json();
+    const count = Array.isArray(sessions) ? sessions.length : 0;
+    els.cachedSessionsCount.textContent = `📦 جلسات محفوظة: ${count}`;
+  } catch (err) {
+    els.cachedSessionsCount.textContent = `📦 جلسات محفوظة: —`;
+  }
+}
+
+async function showCachedSessions() {
+  if (!els.cachedSessionsList) return;
+  try {
+    const res = await fetch('/api/list-sessions');
+    const sessions = await res.json();
+    refreshCachedSessionsCount();
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      els.cachedSessionsList.innerHTML = '<p class="no-sessions">مفيش جلسات محفوظة.</p>';
+      return;
+    }
+    const now = Date.now();
+    els.cachedSessionsList.innerHTML = sessions.map(s => {
+      const exp = s.expiresAt ? new Date(s.expiresAt).toLocaleString() : 'غير معروف';
+      const isValid = s.expiresAt ? s.expiresAt > now : true;
+      const statusClass = isValid ? 'valid' : 'expired';
+      const statusLabel = isValid ? '✅ صالحة' : '❌ منتهية';
+      return `<div class="session-item ${statusClass}">
+        <div class="session-header">
+          <span class="session-username">${escapeHtml(s.username)}</span>
+          <span class="session-status">${statusLabel}</span>
+        </div>
+        <div class="session-details">${s.cookiesCount || 0} كوكيز · ${s.localStorageCount || 0} LS · ${s.sessionStorageCount || 0} SS · تنتهي: ${exp}</div>
+        <button class="btn-delete-session" data-username="${escapeHtml(s.username)}" title="حذف الجلسة">🗑️</button>
+      </div>`;
+    }).join('');
+    els.cachedSessionsList.querySelectorAll('.btn-delete-session').forEach(btn => {
+      btn.addEventListener('click', () => deleteSession(btn.dataset.username));
+    });
+  } catch (err) {
+    els.cachedSessionsList.innerHTML = `<p class="no-sessions error">فشل تحميل الجلسات: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function transferSeats() {
+  const fromUsernames = getSelectedTransferUsernames(els.transferFromList);
+  const toUsernames = getSelectedTransferUsernames(els.transferToList);
+  if (fromUsernames.length === 0) return alert('اختر حساب مصدر واحد على الأقل');
+  if (toUsernames.length === 0) return alert('اختر حساب وجهة واحد على الأقل');
+  const overlap = fromUsernames.filter(u => toUsernames.includes(u));
+  if (overlap.length) return alert(`لا يمكن أن يكون الحساب مصدراً ووجهةً معاً: ${overlap.join(', ')}`);
+  // Transfer mode and batch size are now controlled automatically by the backend.
+  const url = els.eventUrl?.value?.trim();
+  if (!url) return alert('أدخل رابط الفعالية أولاً');
+  const targetSections = getSelectedSections();
+  // Build plan-based payload: each destination carries its ticket count (1-30)
+  // and its proxy preference so the server does not force proxy testing when the
+  // account is set to direct.
+  // Distribution rule for transfers: every destination receives its configured
+  // transferTicketCount (default 5, max 30). Any remaining seats stay on source.
+  const destinations = toUsernames.map(u => {
+    const acc = accounts.find(a => a.username === u);
+    return { username: u, ticketCount: acc?.transferTicketCount || 5, useProxy: acc?.useProxy === true };
+  });
+
+  // Also send the full destination account objects (including credentials,
+  // holdToken/cookies, and proxy preference) so the server can launch each
+  // destination using the exact same settings the account would use in the
+  // Accounts section. Transfer proxy logic is isolated from account proxy logic.
+  const destinationAccounts = toUsernames.map(u => {
+    const acc = accounts.find(a => a.username === u) || {};
+    const base = {
+      username: u,
+      ticketCount: acc.transferTicketCount || 5,
+      useProxy: acc.useProxy === true,
+      url: acc.url || url,
+      targetSections: acc.targetSections || targetSections,
+    };
+    if (acc.type === 'holdToken') {
+      base.type = 'holdToken';
+      base.holdToken = acc.holdToken;
+      base.loginEmail = acc.loginEmail || '';
+      base.loginPassword = acc.loginPassword || '';
+      base.rawCookies = acc.rawCookies || '';
+      base.structuredCookies = acc.structuredCookies || null;
+      base.token = acc.token || '';
+      base.refreshToken = acc.refreshToken || '';
+      base.queueToken = acc.queueToken || '';
+      base.cfClearance = acc.cfClearance || '';
+      base.recaptchaToken = acc.recaptchaToken || '';
+    } else {
+      base.type = 'credentials';
+      base.password = acc.password || '';
+    }
+    return base;
+  });
+  transferProgress.active = true;
+  transferProgress.abortController = new AbortController();
+  // Wait for the backend plan to report the real total seat count instead of
+  // summing every destination's ticket count (which produced confusing labels
+  // like "0 / 150" when only 30 seats were actually held).
+  updateTransferProgress('plan-built', {
+    totalDestinations: destinations.length,
+    totalSeats: 0,
+  });
+  if (els.cancelTransferBtn) els.cancelTransferBtn.classList.remove('hidden');
+
+  try {
+    setLoading(true);
+    const v3Body = {
+      masterUsernames: fromUsernames,
+      destinations,
+      destinationAccounts,
+      url,
+      targetSections,
+    };
+    const v2Body = {
+      masterUsernames: fromUsernames,
+      destinations,
+      destinationAccounts,
+      url,
+      targetSections,
+      mode: 'auto',
+      batchSize: 5,
+      distribution: 'manual',
+      sniperMode: true,
+    };
+
+    // Always try v3 first (session-based, fastest). Fall back to v2 on zero transfer or error.
+    if (els.transferEngineStatus) els.transferEngineStatus.textContent = '⚡ جاري النقل عبر v3...';
+    updateTransferProgress('trying-v3');
+    let json;
+    try {
+      const v3Res = await fetch('/api/transfer-seats-v3', {
+        method: 'POST',
+        signal: transferProgress.abortController.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(v3Body),
+      });
+      json = await v3Res.json();
+      if (json.error) throw new Error(json.error);
+      if ((json.totalTransferred || 0) === 0 && (json.totalSeats || json.totalFailed || 0) > 0) {
+        throw new Error('v3 transferred zero seats');
+      }
+    } catch (v3Err) {
+      if (v3Err.name === 'AbortError') throw v3Err;
+      log(`⚠️ v3 لم ينجح (${v3Err.message}); جاري التبديل إلى v2...`, 'warning');
+      if (els.transferEngineStatus) els.transferEngineStatus.textContent = '⚡ v3 فشل، جاري v2...';
+      updateTransferProgress('trying-v2');
+      const v2Res = await fetch('/api/transfer-seats', {
+        method: 'POST',
+        signal: transferProgress.abortController.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(v2Body),
+      });
+      json = await v2Res.json();
+      if (json.error) throw new Error(json.error);
+    }
+
+    updateTransferProgress('done', { totalTransferred: json.totalTransferred || 0 });
+    log(`✅ تم نقل ${json.totalTransferred || 0} مقعد عبر ${json.details?.length || 0} وجهة`);
+    for (const r of json.details || []) {
+      log(`• ${r.destination}: ${r.transferred || 0} مقعد (${r.failed || 0} فُقد)`);
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      log('تم إلغاء نقل المقاعد');
+    } else {
+      updateTransferProgress('failed');
+      log(`فشل نقل المقاعد: ${err.message}`, 'error');
+    }
+  } finally {
+    setLoading(false);
+    resetTransferProgress();
+    if (els.transferEngineStatus) els.transferEngineStatus.textContent = '⚡ النقل التلقائي: v3 ← v2';
+  }
+}
+
+async function transferSeatsHeadless() {
+  const fromUsernames = getSelectedTransferUsernames(els.transferFromList);
+  const toUsernames = getSelectedTransferUsernames(els.transferToList);
+  if (fromUsernames.length === 0) return alert('اختر حساب مصدر واحد على الأقل');
+  if (fromUsernames.length > 1) return alert('النقل المباشر يدعم مصدر واحد فقط حالياً');
+  if (toUsernames.length === 0) return alert('اختر حساب وجهة واحد على الأقل');
+  const overlap = fromUsernames.filter(u => toUsernames.includes(u));
+  if (overlap.length) return alert(`لا يمكن أن يكون الحساب مصدراً ووجهةً معاً: ${overlap.join(', ')}`);
+
+  const url = els.eventUrl?.value?.trim();
+  if (!url) return alert('أدخل رابط الفعالية أولاً');
+
+  setLoading(true);
+  if (els.transferEngineStatus) els.transferEngineStatus.textContent = '🚀 نقل مباشر Headless...';
+  log(`🚀 بدء نقل مباشر من ${fromUsernames[0]} إلى ${toUsernames.length} وجهة`);
+
+  try {
+    const selectedAccounts = accounts.filter(a => a.selected);
+    const res = await fetch('/api/transfer-seats-headless', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceUsername: fromUsernames[0],
+        destUsernames: toUsernames,
+        url,
+        channel: 'NO_CHANNEL',
+        accounts: selectedAccounts.map(a => ({
+          username: a.username,
+          password: a.password,
+          type: a.type,
+          useProxy: a.useProxy,
+          holdToken: a.holdToken,
+          loginEmail: a.loginEmail,
+          loginPassword: a.loginPassword,
+          rawCookies: a.rawCookies,
+          structuredCookies: a.structuredCookies,
+          token: a.token,
+          refreshToken: a.refreshToken,
+          queueToken: a.queueToken,
+          cfClearance: a.cfClearance,
+          recaptchaToken: a.recaptchaToken,
+        })),
+      }),
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error);
+    log(`✅ تم نقل ${json.totalTransferred || 0} مقعد عبر النقل المباشر`);
+    for (const r of json.details || []) {
+      log(`• ${r.destination}: ${r.held?.length || 0} مقعد (${r.missing?.length || 0} فُقد)`);
+    }
+  } catch (err) {
+    log(`فشل النقل المباشر: ${err.message}`, 'error');
+  } finally {
+    setLoading(false);
+    if (els.transferEngineStatus) els.transferEngineStatus.textContent = '⚡ النقل التلقائي: v3 ← v2';
+  }
+}
+
+if (els.cancelTransferBtn) {
+  els.cancelTransferBtn.addEventListener('click', () => {
+    if (transferProgress.abortController) {
+      transferProgress.abortController.abort();
+    }
+    resetTransferProgress();
+  });
+}
+
+if (els.transferSeatsBtn) els.transferSeatsBtn.addEventListener('click', transferSeats);
+if (els.transferSeatsHeadlessBtn) els.transferSeatsHeadlessBtn.addEventListener('click', transferSeatsHeadless);
+if (els.harvestSelectedSessionsBtn) els.harvestSelectedSessionsBtn.addEventListener('click', harvestSelectedSessions);
+if (els.showCachedSessionsBtn) els.showCachedSessionsBtn.addEventListener('click', showCachedSessions);
+function selectAllSources() { setAllTransferChecked(els.transferFromList, true); scheduleUpdateTransferSelects(); }
+function deselectAllSources() { setAllTransferChecked(els.transferFromList, false); scheduleUpdateTransferSelects(); }
+function selectAllDestinations() { setAllTransferChecked(els.transferToList, true); scheduleUpdateTransferSelects(); }
+function deselectAllDestinations() { setAllTransferChecked(els.transferToList, false); scheduleUpdateTransferSelects(); }
+
+if (els.selectAllSourcesBtn) els.selectAllSourcesBtn.addEventListener('click', selectAllSources);
+if (els.deselectAllSourcesBtn) els.deselectAllSourcesBtn.addEventListener('click', deselectAllSources);
+if (els.selectAllDestsBtn) els.selectAllDestsBtn.addEventListener('click', selectAllDestinations);
+if (els.deselectAllDestsBtn) els.deselectAllDestsBtn.addEventListener('click', deselectAllDestinations);
+if (els.setAllTransferProxyBtn) els.setAllTransferProxyBtn.addEventListener('click', () => setAllTransferProxyMode(true));
+if (els.setAllTransferDirectBtn) els.setAllTransferDirectBtn.addEventListener('click', () => setAllTransferProxyMode(false));
+if (els.applyBulkTransferTicketCountBtn) els.applyBulkTransferTicketCountBtn.addEventListener('click', applyBulkTransferTicketCount);
+
+function filterVisibleLogs(query) {
+  if (!els.logs) return;
+  const q = (query || '').trim().toLowerCase();
+  Array.from(els.logs.children).forEach(entry => {
+    entry.style.display = q && !entry.textContent.toLowerCase().includes(q) ? 'none' : '';
+  });
+}
+
+if (els.logSearch) {
+  els.logSearch.addEventListener('input', (e) => filterVisibleLogs(e.target.value));
+}
+
 els.downloadLogsBtn.addEventListener('click', async () => {
   try {
-    const res = await fetch('/api/logs');
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error);
-    const blob = new Blob([json.logs], { type: 'text/plain' });
+    let text = '';
+    try {
+      const res = await fetch('/api/logs');
+      const json = await res.json();
+      if (json.success && typeof json.logs === 'string') {
+        text = json.logs;
+      }
+    } catch (fetchErr) {
+      // Fallback to visible logs if the server endpoint fails.
+      text = els.logs ? els.logs.innerText || '' : '';
+    }
+    const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `kimiko-logs-${new Date().toISOString().slice(0, 10)}.txt`;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 2000);
     log('تم تحميل السجل');
   } catch (err) {
     log(`فشل تحميل السجل: ${err.message}`, 'error');
@@ -1407,7 +2528,17 @@ els.clearLogsBtn.addEventListener('click', () => {
   els.logs.innerHTML = '';
 });
 
+function isAccountActiveSession(acc) {
+  if (!acc) return false;
+  return acc.stage !== 'idle' && acc.stage !== 'error';
+}
+
 async function proceedAccount(username) {
+  const acc = accounts.find(a => a.username === username);
+  if (!isAccountActiveSession(acc)) {
+    log(`لا يوجد جلسة نشطة لـ ${username}؛ ابدأ الحجز أولاً`);
+    return;
+  }
   try {
     const res = await fetch('/api/proceed-payment', {
       method: 'POST',
@@ -1424,6 +2555,10 @@ async function proceedAccount(username) {
 
 async function stopAccount(username) {
   const acc = accounts.find(a => a.username === username);
+  if (!isAccountActiveSession(acc)) {
+    log(`لا يوجد جلسة نشطة لـ ${username} لإيقافها`);
+    return;
+  }
   if (acc) {
     acc.stage = 'paused';
     acc.sniperActive = false;
@@ -1448,6 +2583,16 @@ async function stopAccount(username) {
 }
 
 async function releaseAccount(username) {
+  const acc = accounts.find(a => a.username === username);
+  if (!isAccountActiveSession(acc)) {
+    if (acc) {
+      acc.seats = [];
+      acc.stage = 'idle';
+      renderAccounts();
+    }
+    log(`تم مسح المقاعد المحلية لـ ${username}`);
+    return;
+  }
   try {
     const res = await fetch('/api/release-hold', {
       method: 'POST',
@@ -1456,7 +2601,6 @@ async function releaseAccount(username) {
     });
     const json = await res.json();
     if (!json.success) throw new Error(json.error);
-    const acc = accounts.find(a => a.username === username);
     if (acc) {
       acc.seats = [];
       acc.stage = 'idle';
@@ -1703,10 +2847,23 @@ if (els.addCaptchaKeyBtn) {
   els.addCaptchaKeyBtn.addEventListener('click', addCaptchaKey);
 }
 
+if (els.autoDetectMaxTickets) {
+  els.autoDetectMaxTickets.addEventListener('change', () => {
+    if (els.autoDetectMaxTickets.checked && detectedMaxTickets) {
+      applyDetectedMaxTickets(detectedMaxTickets);
+    } else {
+      log(els.autoDetectMaxTickets.checked
+        ? 'الاكتشاف التلقائي للتذاكر مفعّل؛ سيتم التحديث عند جلب الفعالية التالية.'
+        : 'الاكتشاف التلقائي للتذاكر معطّل.');
+    }
+  });
+}
+
 // Init
 running = false;
 setLoading(false);
 renderAccounts();
+updateTransferSelects();
 loadEstimatedConcurrency();
 loadAccountsFromServer();
 loadProxiesFromServer();

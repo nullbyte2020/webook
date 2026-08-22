@@ -392,6 +392,28 @@ button.big {
   margin-bottom: 14px;
 }
 
+.account-bulk-actions-bar {
+  margin-bottom: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.account-bulk-actions-bar button {
+  white-space: nowrap;
+}
+
+.bulk-ticket-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.95em;
+  color: var(--text);
+}
+
+.bulk-ticket-label input {
+  width: 64px;
+}
+
 .add-account-card {
   background: #0f0f13;
   border: 1px solid var(--border);
@@ -1417,4 +1439,425 @@ button.big {
     flex: 1 1 calc(50% - 5px);
     min-width: unset;
   }
+}
+
+/* Token Manager & Seat Transfer cards */
+.token-manager .row,
+.seat-transfer-card .row {
+  margin-top: 12px;
+}
+
+.seat-transfer-card .form-row {
+  grid-template-columns: 2fr 2fr 1fr 1fr;
+}
+
+@media (max-width: 768px) {
+  .seat-transfer-card .form-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.transfer-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 14px;
+  align-items: start;
+}
+
+.transfer-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.transfer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.transfer-header label {
+  margin: 0;
+}
+
+.transfer-account-list {
+  max-height: 220px;
+  overflow-y: auto;
+  background: #0c0c11;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+}
+
+.transfer-account-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.transfer-account-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.transfer-account-item input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+.transfer-account-item .acc-stage {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-right: auto;
+}
+
+.transfer-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 120px;
+}
+
+button.tiny {
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  border-radius: 6px;
+}
+
+@media (max-width: 768px) {
+  .transfer-grid {
+    grid-template-columns: 1fr;
+  }
+  .transfer-options {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+
+.transfer-distribution-preview {
+  margin-top: 14px;
+  padding: 12px;
+  background: #0c0c11;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.transfer-distribution-preview h4 {
+  margin: 0 0 10px;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+}
+
+.transfer-distribution-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  margin-bottom: 8px;
+}
+
+.transfer-distribution-item:last-child {
+  margin-bottom: 0;
+}
+
+.transfer-distribution-user {
+  font-weight: 600;
+  min-width: 180px;
+  color: var(--text-primary);
+}
+
+.transfer-distribution-seats {
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.transfer-destination-status-list {
+  margin-top: 14px;
+  padding: 12px;
+  background: #0c0c11;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.transfer-destination-status-list h4 {
+  margin: 0 0 10px;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+}
+
+.destination-status-item {
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  margin-bottom: 8px;
+}
+
+.destination-status-item:last-child {
+  margin-bottom: 0;
+}
+
+.destination-status-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.destination-status-user {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.destination-status-state {
+  font-size: 0.85rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.destination-status-complete .destination-status-state {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.destination-status-failed .destination-status-state {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.destination-status-preparing .destination-status-state {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.destination-status-seats {
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  margin-bottom: 4px;
+}
+
+.destination-status-result {
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+
+.destination-status-error {
+  font-size: 0.8rem;
+  color: var(--danger);
+  margin-top: 4px;
+}
+
+.session-management-panel {
+  margin-bottom: 16px;
+  padding: 14px;
+  background: #0c0c11;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.session-management-panel h4 {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+}
+
+.transfer-engine-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+}
+
+.transfer-engine-row label {
+  font-weight: 600;
+}
+
+.cached-sessions-list {
+  margin-top: 10px;
+}
+
+.cached-session-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.cached-session-user {
+  font-weight: 600;
+  min-width: 200px;
+}
+
+.cached-session-meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.cached-session-expiry {
+  color: var(--warning);
+  font-size: 0.8rem;
+  margin-right: auto;
+}
+
+.btn-delete-session {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+/* Transfer section refreshed layout */
+.transfer-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.transfer-info span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.transfer-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+button.tiny.secondary {
+  background: #1f1f28;
+  color: var(--muted);
+}
+
+button.tiny.secondary:hover {
+  color: var(--text);
+}
+
+/* Session management details block */
+.session-management-details {
+  margin-bottom: 16px;
+  background: #0c0c11;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.session-management-details summary {
+  padding: 12px 14px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text);
+  user-select: none;
+}
+
+.session-management-content {
+  padding: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.session-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  transition: border-color 0.2s;
+}
+
+.session-item.valid {
+  border-color: rgba(34, 197, 94, 0.35);
+  background: rgba(34, 197, 94, 0.05);
+}
+
+.session-item.expired {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.05);
+  opacity: 0.8;
+}
+
+.session-header {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-username {
+  display: block;
+  font-weight: 600;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-status {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  margin-top: 4px;
+}
+
+.session-item.valid .session-status {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.session-item.expired .session-status {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.session-details {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-right: auto;
+}
+
+.no-sessions {
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 12px;
 }
